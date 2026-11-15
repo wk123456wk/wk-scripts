@@ -1,4 +1,4 @@
--- ===== WK 辅助菜单 (纯净飞行版 + 强力吸附 手机版) =====
+-- ===== WK 辅助菜单 (纯净飞行版 + 强力吸附V2 手机版) =====
 local p = game:GetService('Players').LocalPlayer
 local R = game:GetService('RunService')
 local U = game:GetService('UserInputService')
@@ -126,10 +126,11 @@ end
 -- ==========================================
 local adsorbEnabled = false
 local ctrlPart = nil
-local ctrlBP, ctrlBAV, ctrlSB = nil, nil, nil
+local ctrlBP, ctrlSB = nil, nil
 local ctrlHoverLow, ctrlHoverHigh = 5.7, 7.2 -- 悬浮弹跳高度范围
 local adsorbRadius = 40 -- 吸附搜索半径
 local adsorbStartTime = tick()
+local ctrlSpinAngle = 0 -- 物体自转角度
 
 local rainbowColors = {
     Color3.fromRGB(255, 0, 0),
@@ -143,7 +144,6 @@ local rainbowColors = {
 
 local function releaseCtrlPart()
     if ctrlBP then pcall(function() ctrlBP:Destroy() end); ctrlBP = nil end
-    if ctrlBAV then pcall(function() ctrlBAV:Destroy() end); ctrlBAV = nil end
     if ctrlSB then pcall(function() ctrlSB:Destroy() end); ctrlSB = nil end
     if ctrlPart and ctrlPart.Parent then
         pcall(function() ctrlPart.CanCollide = true end)
@@ -155,24 +155,19 @@ local function grabCtrlPart(part)
     releaseCtrlPart()
     ctrlPart = part
     adsorbStartTime = tick()
+    ctrlSpinAngle = 0
     pcall(function() part.CanCollide = false end)
+    -- 先拉近一点, 方便抢到物理所有权
+    pcall(function() part.CFrame = part.CFrame + Vector3.new(0, 2, 0) end)
 
-    -- 悬浮定位
+    -- 悬浮定位 (挂在组件根部件上, 无限大力, 任何重物都吸得动)
     ctrlBP = Instance.new('BodyPosition')
     ctrlBP.Name = 'WK_BP'
-    ctrlBP.P = 1000000
-    ctrlBP.D = 2000 -- 阻尼, 防止过冲乱飞
-    ctrlBP.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+    ctrlBP.P = 100000
+    ctrlBP.D = 2000
+    ctrlBP.MaxForce = Vector3.new(math.huge(), math.huge(), math.huge())
     if rp then ctrlBP.Position = rp.Position + Vector3.new(0, ctrlHoverHigh, 0) end
     ctrlBP.Parent = part
-
-    -- 稳定自转
-    ctrlBAV = Instance.new('BodyAngularVelocity')
-    ctrlBAV.Name = 'WK_BAV'
-    ctrlBAV.P = 1e8
-    ctrlBAV.MaxTorque = Vector3.new(0, 1e8, 0)
-    ctrlBAV.AngularVelocity = Vector3.new(0, 12, 0)
-    ctrlBAV.Parent = part
 
     -- 随机颜色高亮框
     ctrlSB = Instance.new('SelectionBox')
@@ -182,7 +177,7 @@ local function grabCtrlPart(part)
     ctrlSB.Parent = part
 end
 
--- 查找附近最近的可抓取物体 (排除所有角色部位)
+-- 查找附近最近的可抓取物体 (取组件根部件, 排除所有角色)
 local function findNearestPart(radius)
     if not rp then return nil end
     local params = OverlapParams.new()
@@ -190,14 +185,19 @@ local function findNearestPart(radius)
     params.FilterDescendantsInstances = {p.Character}
     local parts = workspace:GetPartBoundsInRadius(rp.Position, radius, params)
     local best, bestDist = nil, radius
+    local seenRoots = {}
     for _, part in ipairs(parts) do
-        if not part.Anchored then
-            local model = part:FindFirstAncestorOfClass('Model')
+        -- 关键: 取整个焊接组件的根部件, BodyPosition挂在子部件上无效
+        local root = part.AssemblyRootPart or part
+        if root and not seenRoots[root] then
+            seenRoots[root] = true
+            local anchored = root.Anchored or root.AssemblyAnchored
+            local model = root:FindFirstAncestorOfClass('Model')
             local isCharPart = model and model:FindFirstChildOfClass('Humanoid') ~= nil
-            if not isCharPart then
-                local d = (part.Position - rp.Position).Magnitude
+            if not anchored and not isCharPart then
+                local d = (root.Position - rp.Position).Magnitude
                 if d < bestDist then
-                    best, bestDist = part, d
+                    best, bestDist = root, d
                 end
             end
         end
@@ -205,8 +205,8 @@ local function findNearestPart(radius)
     return best
 end
 
--- 吸附主循环 (每帧运行, 强力锁定防掉)
-R.RenderStepped:Connect(function()
+-- 吸附主循环 (每帧运行, 双保险: BodyPosition + 直接驱动坐标)
+R.RenderStepped:Connect(function(dt)
     if not adsorbEnabled then return end
     if not rp or not rp.Parent then return end
 
@@ -222,16 +222,26 @@ R.RenderStepped:Connect(function()
         pcall(function() ctrlPart:SetNetworkOwner(p) end)
         pcall(function() ctrlPart.CanCollide = false end)
         -- 锁死速度, 防止重力拉扯掉落
-        ctrlPart.AssemblyLinearVelocity = Vector3.zero
-        ctrlPart.Velocity = Vector3.zero
+        pcall(function()
+            ctrlPart.AssemblyLinearVelocity = Vector3.zero
+        end)
 
         -- 平滑弹跳 (正弦波在 5.7 ~ 7.2 之间浮动)
+        local mid = (ctrlHoverLow + ctrlHoverHigh) / 2
+        local amp = (ctrlHoverHigh - ctrlHoverLow) / 2
+        local yOff = mid + amp * math.sin((tick() - adsorbStartTime) * 3)
+        local targetPos = rp.Position + Vector3.new(0, yOff, 0)
+
+        -- 保险1: BodyPosition 拉向目标 (有物理所有权时对全服生效)
         if ctrlBP and ctrlBP.Parent then
-            local mid = (ctrlHoverLow + ctrlHoverHigh) / 2
-            local amp = (ctrlHoverHigh - ctrlHoverLow) / 2
-            local yOff = mid + amp * math.sin((tick() - adsorbStartTime) * 3)
-            ctrlBP.Position = rp.Position + Vector3.new(0, yOff, 0)
+            ctrlBP.Position = targetPos
         end
+
+        -- 保险2: 每帧直接驱动位置 + 自转 (本地视角必定生效)
+        ctrlSpinAngle = ctrlSpinAngle + dt * 10
+        pcall(function()
+            ctrlPart.CFrame = CFrame.new(targetPos) * CFrame.Angles(0, ctrlSpinAngle, 0)
+        end)
     end
 end)
 
@@ -382,4 +392,4 @@ p.CharacterAdded:Connect(function(char)
     spinAngle = 0
 end)
 
-print('WK 纯净飞行版 (强力吸附手机版) 已加载')
+print('WK 纯净飞行版 (强力吸附V2) 已加载')
