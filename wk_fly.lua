@@ -1,4 +1,4 @@
--- ===== WK 辅助菜单 (纯净飞行版) =====
+-- ===== WK 辅助菜单 (纯净飞行版 + 控制物体) =====
 local p = game:GetService('Players').LocalPlayer
 local R = game:GetService('RunService')
 local U = game:GetService('UserInputService')
@@ -46,6 +46,7 @@ local animSpeedMult = 6
 local origWalkSpeed = 16
 
 local rp, h
+local mouse = p:GetMouse()
 local function initChar()
     if p.Character then
         rp = p.Character:WaitForChild('HumanoidRootPart')
@@ -92,6 +93,77 @@ local function toggleSkybox(state)
         sky.SkyboxLf = origSky.Lf; sky.SkyboxRt = origSky.Rt; sky.SkyboxUp = origSky.Up
     end
 end
+
+-- ==========================================
+-- 控制物体 (对准未锚定物体按Q，悬浮头顶旋转弹跳)
+-- ==========================================
+local ctrlEnabled = false
+local ctrlPart = nil
+local ctrlBP, ctrlBAV, ctrlSB = nil, nil, nil
+local ctrlHoverLow, ctrlHoverHigh = 5.7, 7.2 -- 悬浮弹跳的两个高度
+
+local rainbowColors = {
+    Color3.fromRGB(255, 0, 0),
+    Color3.fromRGB(255, 170, 0),
+    Color3.fromRGB(255, 255, 0),
+    Color3.fromRGB(0, 255, 0),
+    Color3.fromRGB(0, 170, 255),
+    Color3.fromRGB(170, 0, 255),
+    Color3.fromRGB(255, 255, 255),
+}
+
+local function releaseCtrlPart()
+    if ctrlBP then pcall(function() ctrlBP:Destroy() end); ctrlBP = nil end
+    if ctrlBAV then pcall(function() ctrlBAV:Destroy() end); ctrlBAV = nil end
+    if ctrlSB then pcall(function() ctrlSB:Destroy() end); ctrlSB = nil end
+    if ctrlPart and ctrlPart.Parent then
+        pcall(function() ctrlPart.CanCollide = true end)
+    end
+    ctrlPart = nil
+end
+
+local function grabCtrlPart(part)
+    releaseCtrlPart()
+    ctrlPart = part
+    pcall(function() part.CanCollide = false end)
+
+    -- 悬浮定位
+    ctrlBP = Instance.new('BodyPosition')
+    ctrlBP.Name = 'WK_BP'
+    ctrlBP.P = 1000000
+    ctrlBP.MaxForce = Vector3.new(100000, 100000, 100000)
+    if rp then ctrlBP.Position = rp.Position + Vector3.new(0, ctrlHoverHigh, 0) end
+    ctrlBP.Parent = part
+
+    -- 疯狂自转
+    ctrlBAV = Instance.new('BodyAngularVelocity')
+    ctrlBAV.Name = 'WK_BAV'
+    ctrlBAV.P = 1e9
+    ctrlBAV.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+    ctrlBAV.AngularVelocity = Vector3.new(0, 25, 0)
+    ctrlBAV.Parent = part
+
+    -- 随机颜色高亮框
+    ctrlSB = Instance.new('SelectionBox')
+    ctrlSB.Name = 'WK_SB'
+    ctrlSB.Adornee = part
+    ctrlSB.Color3 = rainbowColors[math.random(1, #rainbowColors)]
+    ctrlSB.Parent = part
+end
+
+-- 悬浮弹跳循环 (5.7 <-> 7.2 来回弹跳)
+task.spawn(function()
+    local up = true
+    while true do
+        task.wait(0.3)
+        if ctrlEnabled and ctrlPart and ctrlPart.Parent and ctrlBP and ctrlBP.Parent and rp and rp.Parent then
+            local yOff = up and ctrlHoverHigh or ctrlHoverLow
+            ctrlBP.Position = rp.Position + Vector3.new(0, yOff, 0)
+            pcall(function() ctrlPart.CanCollide = false end)
+            up = not up
+        end
+    end
+end)
 
 -- ==========================================
 -- 主循环 (飞行 / 旋转 / 动画)
@@ -178,6 +250,20 @@ TabSky:CreateToggle({
     Callback = function(state) toggleSkybox(state) end,
 })
 
+TabFun:CreateSection("控制物体 (对准物体按Q)")
+TabFun:CreateToggle({
+    Name = "开启物体控制",
+    CurrentValue = false,
+    Callback = function(state)
+        ctrlEnabled = state
+        if not state then releaseCtrlPart() end
+    end,
+})
+TabFun:CreateButton({
+    Name = "释放当前物体",
+    Callback = function() releaseCtrlPart() end,
+})
+
 TabFun:CreateSection("高速旋转")
 TabFun:CreateToggle({
     Name = "开启高速旋转",
@@ -218,16 +304,28 @@ U.InputBegan:Connect(function(input, processed)
         local t = Window:GetToggle("开启飞行 (快捷键 F)")
         if t then t:Toggle() end
     end
+    -- 按Q抓取/释放物体
+    if input.KeyCode == Enum.KeyCode.Q and ctrlEnabled then
+        local target = mouse.Target
+        if target and target:IsA('BasePart') and not target.Anchored then
+            if target == ctrlPart then
+                releaseCtrlPart()
+            else
+                grabCtrlPart(target)
+            end
+        end
+    end
 end)
 
 -- ===== 角色重生处理 =====
 p.CharacterAdded:Connect(function(char)
     if flyToggle then flyToggle:Set(false) end
     disableFly()
+    releaseCtrlPart()
     rp = char:WaitForChild('HumanoidRootPart')
     h = char:WaitForChild('Humanoid')
     origWalkSpeed = h.WalkSpeed
     spinAngle = 0
 end)
 
-print('WK 纯净飞行版已加载')
+print('WK 纯净飞行版 (含控制物体) 已加载')
