@@ -1,4 +1,4 @@
--- ===== WK 辅助菜单 (纯净飞行版 + 控制物体 手机版) =====
+-- ===== WK 辅助菜单 (纯净飞行版 + 强力吸附 手机版) =====
 local p = game:GetService('Players').LocalPlayer
 local R = game:GetService('RunService')
 local U = game:GetService('UserInputService')
@@ -14,12 +14,39 @@ for _, parent in ipairs({CoreGui, PlayerGui}) do
     end
 end
 
+-- 极速启动弹窗 (防止黑屏等待)
+local loadGui = Instance.new('ScreenGui')
+loadGui.Name = 'WK_QuickLoad'
+loadGui.DisplayOrder = 999999
+loadGui.Parent = CoreGui
+
+local frame = Instance.new('Frame', loadGui)
+frame.Size = UDim2.new(0, 200, 0, 60)
+frame.Position = UDim2.new(0.5, -100, 0.5, -30)
+frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+Instance.new('UICorner', frame).CornerRadius = UDim.new(0, 8)
+Instance.new('UIStroke', frame).Color = Color3.fromRGB(0, 255, 0)
+
+local loadText = Instance.new('TextLabel', frame)
+loadText.Size = UDim2.new(1, 0, 1, 0)
+loadText.BackgroundTransparency = 1
+loadText.Text = '正在启动 WK 脚本...'
+loadText.TextColor3 = Color3.fromRGB(0, 255, 0)
+loadText.Font = Enum.Font.SourceSansBold
+loadText.TextSize = 16
+
 -- 直接加载 Rayfield
 local success, Rayfield = pcall(function() return loadstring(game:HttpGet('https://sirius.menu/rayfield'))() end)
 if not success or not Rayfield then
     Rayfield = loadstring(game:HttpGet('https://raw.githubusercontent.com/SiriusSoftwareSptd/Rayfield/main/source.lua', true))()
 end
-if not Rayfield then return end
+if not Rayfield then
+    loadText.Text = '网络错误，加载失败'
+    loadText.TextColor3 = Color3.fromRGB(255, 0, 0)
+    task.wait(3)
+    loadGui:Destroy()
+    return
+end
 
 local Window = Rayfield:CreateWindow({
     Name = "WK 辅助菜单",
@@ -27,6 +54,7 @@ local Window = Rayfield:CreateWindow({
     ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
+loadGui:Destroy() -- 菜单创建成功，销毁启动弹窗
 
 local TabFly = Window:CreateTab("飞行控制", 4483362458)
 local TabSky = Window:CreateTab("环境修改", 4483362458)
@@ -46,7 +74,6 @@ local animSpeedMult = 6
 local origWalkSpeed = 16
 
 local rp, h
-local mouse = p:GetMouse()
 local function initChar()
     if p.Character then
         rp = p.Character:WaitForChild('HumanoidRootPart')
@@ -95,14 +122,14 @@ local function toggleSkybox(state)
 end
 
 -- ==========================================
--- 控制物体 (悬浮窗开关控制 + 吸附模式, 手机可用)
+-- 强力吸附 (每帧锁定, 不会掉)
 -- ==========================================
-local ctrlEnabled = false   -- 物体控制总开关
-local adsorbEnabled = false -- 吸附模式: 自动抓取最近的物体
+local adsorbEnabled = false
 local ctrlPart = nil
 local ctrlBP, ctrlBAV, ctrlSB = nil, nil, nil
-local ctrlHoverLow, ctrlHoverHigh = 5.7, 7.2 -- 悬浮弹跳的两个高度
+local ctrlHoverLow, ctrlHoverHigh = 5.7, 7.2 -- 悬浮弹跳高度范围
 local adsorbRadius = 40 -- 吸附搜索半径
+local adsorbStartTime = tick()
 
 local rainbowColors = {
     Color3.fromRGB(255, 0, 0),
@@ -127,22 +154,24 @@ end
 local function grabCtrlPart(part)
     releaseCtrlPart()
     ctrlPart = part
+    adsorbStartTime = tick()
     pcall(function() part.CanCollide = false end)
 
     -- 悬浮定位
     ctrlBP = Instance.new('BodyPosition')
     ctrlBP.Name = 'WK_BP'
     ctrlBP.P = 1000000
-    ctrlBP.MaxForce = Vector3.new(100000, 100000, 100000)
+    ctrlBP.D = 2000 -- 阻尼, 防止过冲乱飞
+    ctrlBP.MaxForce = Vector3.new(1e6, 1e6, 1e6)
     if rp then ctrlBP.Position = rp.Position + Vector3.new(0, ctrlHoverHigh, 0) end
     ctrlBP.Parent = part
 
-    -- 疯狂自转
+    -- 稳定自转
     ctrlBAV = Instance.new('BodyAngularVelocity')
     ctrlBAV.Name = 'WK_BAV'
-    ctrlBAV.P = 1e9
-    ctrlBAV.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
-    ctrlBAV.AngularVelocity = Vector3.new(0, 25, 0)
+    ctrlBAV.P = 1e8
+    ctrlBAV.MaxTorque = Vector3.new(0, 1e8, 0)
+    ctrlBAV.AngularVelocity = Vector3.new(0, 12, 0)
     ctrlBAV.Parent = part
 
     -- 随机颜色高亮框
@@ -153,7 +182,7 @@ local function grabCtrlPart(part)
     ctrlSB.Parent = part
 end
 
--- 查找附近最近的可抓取物体 (排除角色部位)
+-- 查找附近最近的可抓取物体 (排除所有角色部位)
 local function findNearestPart(radius)
     if not rp then return nil end
     local params = OverlapParams.new()
@@ -176,29 +205,32 @@ local function findNearestPart(radius)
     return best
 end
 
--- 悬浮弹跳循环 (5.7 <-> 7.2 来回弹跳)
-task.spawn(function()
-    local up = true
-    while true do
-        task.wait(0.3)
-        if ctrlPart and ctrlPart.Parent and ctrlBP and ctrlBP.Parent and rp and rp.Parent then
-            local yOff = up and ctrlHoverHigh or ctrlHoverLow
-            ctrlBP.Position = rp.Position + Vector3.new(0, yOff, 0)
-            pcall(function() ctrlPart.CanCollide = false end)
-            up = not up
-        end
-    end
-end)
+-- 吸附主循环 (每帧运行, 强力锁定防掉)
+R.RenderStepped:Connect(function()
+    if not adsorbEnabled then return end
+    if not rp or not rp.Parent then return end
 
--- 吸附模式循环: 手里没物体时自动抓最近的
-task.spawn(function()
-    while true do
-        task.wait(0.5)
-        if adsorbEnabled and rp and rp.Parent then
-            if not (ctrlPart and ctrlPart.Parent and ctrlBP and ctrlBP.Parent) then
-                local part = findNearestPart(adsorbRadius)
-                if part then grabCtrlPart(part) end
-            end
+    -- 手里的物体丢了就自动抓下一个最近的
+    if not (ctrlPart and ctrlPart.Parent) then
+        releaseCtrlPart()
+        local part = findNearestPart(adsorbRadius)
+        if part then grabCtrlPart(part) end
+    end
+
+    if ctrlPart and ctrlPart.Parent then
+        -- 每帧抢夺网络所有权, 防止服务器收回后掉落
+        pcall(function() ctrlPart:SetNetworkOwner(p) end)
+        pcall(function() ctrlPart.CanCollide = false end)
+        -- 锁死速度, 防止重力拉扯掉落
+        ctrlPart.AssemblyLinearVelocity = Vector3.zero
+        ctrlPart.Velocity = Vector3.zero
+
+        -- 平滑弹跳 (正弦波在 5.7 ~ 7.2 之间浮动)
+        if ctrlBP and ctrlBP.Parent then
+            local mid = (ctrlHoverLow + ctrlHoverHigh) / 2
+            local amp = (ctrlHoverHigh - ctrlHoverLow) / 2
+            local yOff = mid + amp * math.sin((tick() - adsorbStartTime) * 3)
+            ctrlBP.Position = rp.Position + Vector3.new(0, yOff, 0)
         end
     end
 end)
@@ -288,33 +320,14 @@ TabSky:CreateToggle({
     Callback = function(state) toggleSkybox(state) end,
 })
 
-TabFun:CreateSection("控制物体 (手机用按钮/吸附)")
+TabFun:CreateSection("强力吸附 (自动抓最近物体)")
 TabFun:CreateToggle({
-    Name = "开启物体控制 (电脑端可按Q抓取)",
-    CurrentValue = false,
-    Callback = function(state)
-        ctrlEnabled = state
-        if not state then releaseCtrlPart() end
-    end,
-})
-TabFun:CreateToggle({
-    Name = "开启吸附 (自动抓最近物体)",
+    Name = "开启吸附",
     CurrentValue = false,
     Callback = function(state)
         adsorbEnabled = state
         if not state then releaseCtrlPart() end
     end,
-})
-TabFun:CreateButton({
-    Name = "抓取最近的物体",
-    Callback = function()
-        local part = findNearestPart(adsorbRadius)
-        if part then grabCtrlPart(part) end
-    end,
-})
-TabFun:CreateButton({
-    Name = "释放当前物体",
-    Callback = function() releaseCtrlPart() end,
 })
 
 TabFun:CreateSection("高速旋转")
@@ -356,17 +369,6 @@ U.InputBegan:Connect(function(input, processed)
     if input.KeyCode == Enum.KeyCode.F then
         flyToggle:Set(not flying)
     end
-    -- 按Q抓取/释放物体
-    if input.KeyCode == Enum.KeyCode.Q and ctrlEnabled then
-        local target = mouse.Target
-        if target and target:IsA('BasePart') and not target.Anchored then
-            if target == ctrlPart then
-                releaseCtrlPart()
-            else
-                grabCtrlPart(target)
-            end
-        end
-    end
 end)
 
 -- ===== 角色重生处理 =====
@@ -380,4 +382,4 @@ p.CharacterAdded:Connect(function(char)
     spinAngle = 0
 end)
 
-print('WK 纯净飞行版 (控制物体手机版) 已加载')
+print('WK 纯净飞行版 (强力吸附手机版) 已加载')
