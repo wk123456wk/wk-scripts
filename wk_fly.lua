@@ -1,4 +1,4 @@
--- ===== WK 辅助菜单 (纯净飞行版 + 控制物体) =====
+-- ===== WK 辅助菜单 (纯净飞行版 + 控制物体 手机版) =====
 local p = game:GetService('Players').LocalPlayer
 local R = game:GetService('RunService')
 local U = game:GetService('UserInputService')
@@ -95,12 +95,14 @@ local function toggleSkybox(state)
 end
 
 -- ==========================================
--- 控制物体 (对准未锚定物体按Q，悬浮头顶旋转弹跳)
+-- 控制物体 (悬浮窗开关控制 + 吸附模式, 手机可用)
 -- ==========================================
-local ctrlEnabled = false
+local ctrlEnabled = false   -- 物体控制总开关
+local adsorbEnabled = false -- 吸附模式: 自动抓取最近的物体
 local ctrlPart = nil
 local ctrlBP, ctrlBAV, ctrlSB = nil, nil, nil
 local ctrlHoverLow, ctrlHoverHigh = 5.7, 7.2 -- 悬浮弹跳的两个高度
+local adsorbRadius = 40 -- 吸附搜索半径
 
 local rainbowColors = {
     Color3.fromRGB(255, 0, 0),
@@ -151,16 +153,52 @@ local function grabCtrlPart(part)
     ctrlSB.Parent = part
 end
 
+-- 查找附近最近的可抓取物体 (排除角色部位)
+local function findNearestPart(radius)
+    if not rp then return nil end
+    local params = OverlapParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {p.Character}
+    local parts = workspace:GetPartBoundsInRadius(rp.Position, radius, params)
+    local best, bestDist = nil, radius
+    for _, part in ipairs(parts) do
+        if not part.Anchored then
+            local model = part:FindFirstAncestorOfClass('Model')
+            local isCharPart = model and model:FindFirstChildOfClass('Humanoid') ~= nil
+            if not isCharPart then
+                local d = (part.Position - rp.Position).Magnitude
+                if d < bestDist then
+                    best, bestDist = part, d
+                end
+            end
+        end
+    end
+    return best
+end
+
 -- 悬浮弹跳循环 (5.7 <-> 7.2 来回弹跳)
 task.spawn(function()
     local up = true
     while true do
         task.wait(0.3)
-        if ctrlEnabled and ctrlPart and ctrlPart.Parent and ctrlBP and ctrlBP.Parent and rp and rp.Parent then
+        if ctrlPart and ctrlPart.Parent and ctrlBP and ctrlBP.Parent and rp and rp.Parent then
             local yOff = up and ctrlHoverHigh or ctrlHoverLow
             ctrlBP.Position = rp.Position + Vector3.new(0, yOff, 0)
             pcall(function() ctrlPart.CanCollide = false end)
             up = not up
+        end
+    end
+end)
+
+-- 吸附模式循环: 手里没物体时自动抓最近的
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if adsorbEnabled and rp and rp.Parent then
+            if not (ctrlPart and ctrlPart.Parent and ctrlBP and ctrlBP.Parent) then
+                local part = findNearestPart(adsorbRadius)
+                if part then grabCtrlPart(part) end
+            end
         end
     end
 end)
@@ -228,11 +266,11 @@ R.Heartbeat:Connect(function(dt)
 end)
 
 -- ==========================================
--- UI 配置
+-- UI 配置 (全部悬浮窗开关, 手机可用)
 -- ==========================================
 TabFly:CreateSection("飞行开关")
 local flyToggle = TabFly:CreateToggle({
-    Name = "开启飞行 (快捷键 F)",
+    Name = "开启飞行 (电脑端快捷键 F)",
     CurrentValue = false,
     Callback = function(state) if state then enableFly() else disableFly() end end,
 })
@@ -250,13 +288,28 @@ TabSky:CreateToggle({
     Callback = function(state) toggleSkybox(state) end,
 })
 
-TabFun:CreateSection("控制物体 (对准物体按Q)")
+TabFun:CreateSection("控制物体 (手机用按钮/吸附)")
 TabFun:CreateToggle({
-    Name = "开启物体控制",
+    Name = "开启物体控制 (电脑端可按Q抓取)",
     CurrentValue = false,
     Callback = function(state)
         ctrlEnabled = state
         if not state then releaseCtrlPart() end
+    end,
+})
+TabFun:CreateToggle({
+    Name = "开启吸附 (自动抓最近物体)",
+    CurrentValue = false,
+    Callback = function(state)
+        adsorbEnabled = state
+        if not state then releaseCtrlPart() end
+    end,
+})
+TabFun:CreateButton({
+    Name = "抓取最近的物体",
+    Callback = function()
+        local part = findNearestPart(adsorbRadius)
+        if part then grabCtrlPart(part) end
     end,
 })
 TabFun:CreateButton({
@@ -297,12 +350,11 @@ TabFun:CreateSlider({
     Callback = function(val) animSpeedMult = val end,
 })
 
--- ===== 快捷键 =====
+-- ===== 快捷键 (仅电脑端, 手机请用悬浮窗开关) =====
 U.InputBegan:Connect(function(input, processed)
     if processed then return end
     if input.KeyCode == Enum.KeyCode.F then
-        local t = Window:GetToggle("开启飞行 (快捷键 F)")
-        if t then t:Toggle() end
+        flyToggle:Set(not flying)
     end
     -- 按Q抓取/释放物体
     if input.KeyCode == Enum.KeyCode.Q and ctrlEnabled then
@@ -328,4 +380,4 @@ p.CharacterAdded:Connect(function(char)
     spinAngle = 0
 end)
 
-print('WK 纯净飞行版 (含控制物体) 已加载')
+print('WK 纯净飞行版 (控制物体手机版) 已加载')
