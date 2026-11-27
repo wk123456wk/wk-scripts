@@ -1,5 +1,14 @@
--- ===== WK 视野 + 自动转弯 V8 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
+-- ===== WK 视野 + 自动转弯 V9 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
 -- 适用: 「不要停止 / make sure to drive fast」等雨夜浓雾黑夜驾驶地图
+-- V9 修正 V8 的实测问题 (用户: 「属性看不完，建议移到右上角」):
+--   [问题] 诊断框在左下角 272x92 / 字号13, 手机 DPI 放大后一页只露出标题+1行,
+--          底部被屏幕裁掉; 每页仅4行, 完整属性清单共28页, 根本翻不完 (截图实锤)
+--   -> 整个诊断面板移到【右上角】: AnchorPoint(1,0) + Position(1,-12,0,12),
+--      绝不溢出屏幕; 框加大到 310x268, 字号缩到 11, 更透 (0.35) 少挡速度表
+--   -> 每页 4 行 -> 12 行 (LINES_PER_PAGE), 页数 28 -> 约10
+--   -> 实时状态视图 4 行 -> 8 行: 座位属性/通道/车模型/摇杆中心常显, 不翻页也能看全
+--   -> 报告中超长行按 UTF-8 字符边界截断, 杜绝 TextWrapped=false 时被框右侧裁掉
+--   -> 翻页按钮跟着移到面板正下方, 右对齐; 点诊断框本身同样可翻页
 -- V8 修正 V7 的实测问题:
 --   [问题1] 用户反馈「根本没有复制诊断」: V7 诊断框塞了 9 行文字 + TextWrapped 自动换行,
 --           在手机横屏上溢出屏幕底部, 把下方 y=278 的复制按钮整个挤出可视区 (截图实锤)
@@ -13,7 +22,7 @@
 --             之后用同样格式重放脚本算出的舵量; 学到的名字显示在诊断里, 无需用户截图/复制
 -- 视野逻辑原样保留: 删高频 DescendantAdded 监听 + 字典查重 + 反制节流 + 10 秒低频巡检
 --   性能: 未开启零新增开销; 扫描只在开启/换车时一次; 每帧仅几次属性赋值
---   [WK_VIEW_V8]
+--   [WK_VIEW_V9]
 
 local Lighting  = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
@@ -91,6 +100,7 @@ local WRITE_INT      = true
 local EVERY_FRAME    = true
 local HINGE_ANGLE    = 30
 local DIAG           = true  -- 屏幕诊断 (确认工作后可改 false 隐藏)
+local LINES_PER_PAGE = 12   -- V9: 报告每页行数 (原 4, 页数 28->约10)
 
 -- ==========================================
 -- 状态
@@ -164,16 +174,17 @@ end
 local btn     = mkBtn(0,  "WK 视野：关")
 local btnAuto = mkBtn(54, "自动转弯：关")
 
--- ===== 屏幕诊断 (V8): 4 行 / 不换行 / 固定像素, 保证手机横屏完整可见 =====
-local diag = Instance.new("TextButton")       -- 改成按钮: 点诊断框本身也能复制/翻页
+-- ===== 屏幕诊断 (V9): 右上角 / 12行每页 / 不换行 / 固定像素, 绝不溢出屏幕 =====
+local diag = Instance.new("TextButton")       -- 点诊断框本身也能复制/翻页
 diag.Name = "WK_Diag"
-diag.Size = UDim2.new(0, 272, 0, 92)
-diag.Position = UDim2.new(0, 12, 0.30, 160)
+diag.Size = UDim2.new(0, 310, 0, 268)
+diag.AnchorPoint = Vector2.new(1, 0)          -- 右上角为锚点: 框向左下展开
+diag.Position = UDim2.new(1, -12, 0, 12)     -- 距右边 12 / 距顶 12, 恒在屏幕内
 diag.BackgroundColor3 = Color3.fromRGB(12, 16, 20)
-diag.BackgroundTransparency = 0.22
+diag.BackgroundTransparency = 0.35           -- 更透, 少挡右上角速度表
 diag.BorderSizePixel = 0
 diag.Font = Enum.Font.GothamBold
-diag.TextSize = 13
+diag.TextSize = 11                           -- 缩小字号, 一页装得下 12 行
 diag.TextColor3 = Color3.fromRGB(170, 235, 185)
 diag.TextXAlignment = Enum.TextXAlignment.Left
 diag.TextYAlignment = Enum.TextYAlignment.Top
@@ -183,20 +194,54 @@ diag.Visible = false
 diag.Parent = gui
 pcall(function() Instance.new("UICorner", diag).CornerRadius = UDim.new(0, 8) end)
 
--- 复制按钮: 做成与两个主开关同宽的大按钮, 放在诊断框【上方】, 绝对不会掉出屏幕
+-- 翻页按钮 (V9): 紧跟右上角诊断框【下方】, 同样右对齐, 与报告组成一块面板
 local copyBtn = Instance.new("TextButton")
 copyBtn.Name = "WK_Copy"
-copyBtn.Size = UDim2.new(0, 148, 0, 44)
-copyBtn.Position = UDim2.new(0, 12, 0.30, 108)   -- 紧跟「自动转弯」(y=54, 高44) 之后
+copyBtn.Size = UDim2.new(0, 200, 0, 38)
+copyBtn.AnchorPoint = Vector2.new(1, 0)
+copyBtn.Position = UDim2.new(1, -12, 0, 286)     -- diag 底 = 12+268 = 280, 留 6px 间距
 copyBtn.BackgroundColor3 = Color3.fromRGB(60, 105, 190)
 copyBtn.BorderSizePixel = 0
 copyBtn.Font = Enum.Font.GothamBold
 copyBtn.Text = "复制诊断 / 翻页"
 copyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-copyBtn.TextSize = 13
+copyBtn.TextSize = 12
 copyBtn.Visible = false
 copyBtn.Parent = gui
 pcall(function() Instance.new("UICorner", copyBtn).CornerRadius = UDim.new(0, 22) end)
+
+-- 极小屏钳制: 保证「框 + 按钮」整块恒在屏幕内, 并同步下调每页行数
+do
+    local ok, vp = pcall(function()
+        local c = Workspace.CurrentCamera
+        return c and c.ViewportSize
+    end)
+    if ok and vp and vp.Y > 0 and vp.Y < 340 then
+        local h = math.max(150, math.floor(vp.Y - 76))
+        diag.Size = UDim2.new(0, 310, 0, h)
+        copyBtn.Position = UDim2.new(1, -12, 0, h + 18)
+        LINES_PER_PAGE = math.max(5, math.min(12, math.floor(h / 22)))
+    end
+end
+
+-- 按【字节宽度】截断长行, 逐字符累加预算, 保证 UTF-8 字符边界完整
+local function clipLine(x, n)
+    x = tostring(x)
+    if #x <= n then return x end
+    local budget = n - 3
+    local i, used = 1, 0
+    while i <= #x do
+        local c = x:byte(i)
+        local w = 1
+        if c >= 0xF0 then w = 4
+        elseif c >= 0xE0 then w = 3
+        elseif c >= 0xC0 then w = 2 end
+        if used + w > budget then break end   -- 该字符放不下就停, 绝不留半个字符
+        used = used + w
+        i = i + w
+    end
+    return x:sub(1, i - 1) .. "..."
+end
 
 -- 点击行为: 1) 尝试剪贴板  2) 无论如何把完整报告分页显示在诊断框(截图即可, 不依赖剪贴板)
 local function copyAndPage()
@@ -209,7 +254,7 @@ local function copyAndPage()
             end
         end
     end)
-    local pages = math.max(1, math.ceil(#reportLines / 4))
+    local pages = math.max(1, math.ceil(#reportLines / LINES_PER_PAGE))
     if not showingReport then
         showingReport = true
         reportPage = 1
@@ -220,8 +265,9 @@ local function copyAndPage()
     copyBtn.Text = "报告 " .. reportPage .. "/" .. pages ..
         (done and " · 已复制" or " · 再点翻页")
     if showingReport then
-        local from = (reportPage - 1) * 4 + 1
-        diag.Text = table.concat(reportLines, "\n", from, math.min(#reportLines, from + 3))
+        local from = (reportPage - 1) * LINES_PER_PAGE + 1
+        diag.Text = table.concat(reportLines, "\n", from,
+            math.min(#reportLines, from + LINES_PER_PAGE - 1))
     else
         updateDiag(true)
     end
@@ -781,20 +827,29 @@ updateDiag = function(force)
     if not force and now - diagT < 0.3 then return end
     diagT = now
     local seatType = veh and (veh.isVehicleSeat and "VehicleSeat" or "普通Seat") or "未坐车"
-    -- 屏幕 4 行 (不换行, 固定像素, 保证完整可见)
+    -- 实时状态 8 行 (V9): 关键属性常显, 不点翻页也能一次看全
     local l1 = string.format("座位 %s | 目标 %+.2f", seatType, curSteer)
     local l2 = probeInfo
     local l3 = string.format("摇杆 %s | 触摸 %s",
         (stick and stick.Name) or "未锁定", chanTouch)
     local l4 = string.format("UIS %s | 学习 %s | 候选 R%d V%d",
         (uisOK and "可用" or "不可用"), learnedName, #remoteObjs, #stickVals)
-    if not showingReport then diag.Text = l1 .. "\n" .. l2 .. "\n" .. l3 .. "\n" .. l4 end
+    local l5 = "座位属性 " .. chanSeat .. " | firesignal " .. chanFire
+    local l6 = "通道 knob " .. chanKnob .. " / Val " .. chanVal
+    local l7 = "车 " .. ((veh and veh.model and veh.model.Name) or "无") ..
+        " | 车身 " .. ((veh and veh.body and veh.body.Name) or "无")
+    local l8 = "摇杆中心 " .. ((stickCenter and string.format("%.0f,%.0f R%.0f",
+        stickCenter.X, stickCenter.Y, stickRadius)) or "-")
+    if not showingReport then
+        diag.Text = l1 .. "\n" .. l2 .. "\n" .. l3 .. "\n" .. l4 ..
+            "\n" .. l5 .. "\n" .. l6 .. "\n" .. l7 .. "\n" .. l8
+    end
 
     -- 完整报告 (点「复制诊断 / 翻页」会分页显示在屏幕上, 不依赖剪贴板)
     local L = {}
-    local function add(x) L[#L + 1] = x end
-    add("=== WK V8 报告 (点按钮翻页看全) ===")
-    add(l1); add(l2); add(l3); add(l4)
+    local function add(x) L[#L + 1] = clipLine(x, 46) end
+    add("=== WK V9 诊断报告 ===")
+    add(l1); add(l2); add(l3); add(l4); add(l5); add(l6); add(l7); add(l8)
     add("座位属性: " .. chanSeat .. " | firesignal: " .. chanFire)
     add("通道 knob " .. chanKnob .. " / Val " .. chanVal)
     add("车模型: " .. ((veh and veh.model and veh.model.Name) or "无"))
@@ -821,10 +876,11 @@ updateDiag = function(force)
     reportLines = L
     fullReport = table.concat(L, "\n")
     if showingReport then
-        local from = (reportPage - 1) * 4 + 1
-        local pages = math.max(1, math.ceil(#reportLines / 4))
-        if reportPage > pages then reportPage = 1; from = 1 end
-        diag.Text = table.concat(reportLines, "\n", from, math.min(#reportLines, from + 3))
+        local pages = math.max(1, math.ceil(#reportLines / LINES_PER_PAGE))
+        if reportPage > pages then reportPage = 1 end
+        local from = (reportPage - 1) * LINES_PER_PAGE + 1
+        diag.Text = table.concat(reportLines, "\n", from,
+            math.min(#reportLines, from + LINES_PER_PAGE - 1))
     end
 end
 
@@ -956,4 +1012,4 @@ refresh()
 refreshAuto()
 enableView()
 
-print("WK 已就绪 (视野 + 自动转弯 V8 · 诊断UI修复 · ThumbstickStart通道 · 零联网) [WK_VIEW_V8]")
+print("WK 已就绪 (视野 + 自动转弯 V9 · 诊断移到右上角/12行每页 · ThumbstickStart通道 · 零联网) [WK_VIEW_V9]")
