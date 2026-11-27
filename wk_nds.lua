@@ -1,16 +1,15 @@
--- ===== WK 视野 + 自动转弯 V4 (去雾白昼 · 弯道大幅转向/漂移 · 零联网秒启动) =====
+-- ===== WK 视野 + 自动转弯 V5 (去雾白昼 · 直接驱动屏幕摇杆 · 零联网秒启动) =====
 -- 适用: 「不要停止 / make sure to drive fast」等雨夜浓雾黑夜驾驶地图
--- V4 专治「转弯幅度太小会撞墙」:
---   1) 宽扇区 9 角度(±75°) + 3 档前探(最远 48 stud) → 更早、更广地发现急弯/直角弯
---   2) 转向增益调猛: 偏离 20° 即打满舵 (旧版 50° 才满舵, 中等弯只给半舵)
---   3) 平滑/探测频率提高 (0.8 / 0.08s) → 方向果断到位, 不再拖到贴墙才转
---   4) 前方近处无路面(墙/断路)时【绝不回正】, 强制朝有路一侧满舵避险
---   控制: 自适应 —— 优先写 VehicleSeat.Steer; 自定义脚本车改为车身横摆扭矩兜底
---   漂移: 速度高 + 转向大时叠加横向滑移 + 横摆角速度, 做出甩尾观感
---   性能: 未开启时【零新增开销】; 开启后不用每帧循环 —— 转向值靠属性变更信号维持,
---         路面探测每 0.08 秒一次 (27 条射线), 无全图遍历 / 无 GetDescendants
+-- V5 关键修正: 该游戏转向【不读 VehicleSeat.Steer】, 而是读左下角虚拟摇杆的左右拖动,
+--   所以 V3/V4 写 Steer / 车身扭矩全部落空。V5 改为直接驱动那个摇杆:
+--   1) 自动扫描 PlayerGui / CoreGui, 按名字+左下角位置+圆形尺寸锁定摇杆 knob
+--   2) 优先用 VirtualInputManager 注入真实触摸拖动 (Begin/Change/End), 只动 X 轴不碰油门
+--   3) 触摸注入不可用时自动降级为直接移动 knob.Position (覆盖"每帧读位置"的实现)
+--   4) 保留 Seat.Steer / 扭矩兜底, 以及 V4 全部弯道决策 (宽扇区/提前预判/满舵避险)
+--   诊断: 开启时控制台打印摇杆候选、锁定结果、注入方式; 找错可把名字填进 STICK_NAME
+--   性能: 未开启时【零新增开销】; 开启后只扫描一次, 每 0.08 秒 1 次触摸/属性写, 无每帧循环
 -- 视野逻辑原样保留: 删高频 DescendantAdded 监听 + 字典查重 + 反制节流 + 10 秒低频巡检
---   [WK_VIEW_V4]
+--   [WK_VIEW_V5]
 
 local Lighting  = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
@@ -70,6 +69,15 @@ local DRIFT_YAW      = 0.8   -- 漂移附加横摆
 local TORQUE_YAW     = 1.6   -- 扭矩兜底模式的横摆角速度
 
 -- ==========================================
+-- 配置: 屏幕摇杆驱动 (V5 主通道)
+-- ==========================================
+local STICK_NAME     = ""    -- 留空=自动发现; 自动找错时把控制台打印的名字填这里
+local STICK_SIGN     = 1     -- 若摇杆往反方向拖(拐反了), 把这里改成 -1
+local STICK_RADIUS   = 0     -- 0=按摇杆尺寸自动算; 也可填固定像素(如 60)
+local TOUCH_ID       = 9917  -- 虚拟触摸 id, 避开玩家真实触摸
+local USE_TOUCH      = true  -- 关掉则只用"直接移动 knob"通道
+
+-- ==========================================
 -- 状态
 -- ==========================================
 local ON = true          -- 视野
@@ -85,6 +93,11 @@ local autoThread, autoAlive = nil, false
 local veh, rayParams, lastChar, lastModel = nil, nil, nil, nil
 local steerConn, lastSeat, ctrlMode = nil, nil, nil
 local wasTurning = false
+local stick, stickCenter, stickHomePos, stickRadius = nil, nil, nil, nil
+local touchActive, touchOK, VIM = false, false, nil
+local S_BEGIN  = Enum.UserInputState.Begin.Value
+local S_CHANGE = Enum.UserInputState.Change.Value
+local S_END    = Enum.UserInputState.End.Value
 
 local function setP(obj, prop, val) pcall(function() obj[prop] = val end) end
 local function getP(obj, prop)
@@ -228,6 +241,122 @@ end
 -- ==========================================
 -- 能力B: 自动转弯 + 漂移
 -- ==========================================
+
+-- === 屏幕摇杆驱动 (V5 主通道) ===
+local STICK_KEY = {
+    stick=1, joystick=1, joy=1, wheel=1, steer=1, thumb=1, pad=1, knob=1,
+    drag=1, dial=1, turn=1, direction=1, left=1, handle=1, circle=1,
+}
+local function scoreStick(o, vw, vh)
+    if not o.Visible then return -1 end
+    local ap, as = o.AbsolutePosition, o.AbsoluteSize
+    if as.X < 30 or as.X > 320 or as.Y < 30 or as.Y > 320 then return -1 end
+    local s = 0
+    local n = o.Name:lower()
+    for k in pairs(STICK_KEY) do if n:find(k, 1, true) then s = s + 6 break end end
+    if ap.X < vw * 0.45 and ap.Y > vh * 0.45 then s = s + 5 end
+    local r = as.X / as.Y
+    if r > 0.65 and r < 1.5 then s = s + 3 end
+    if as.X >= 45 and as.X <= 140 then s = s + 3 elseif as.X > 220 then s = s - 2 end
+    if o:IsA("ImageButton") or o:IsA("TextButton") or o:IsA("ImageLabel") then s = s + 2 end
+    return s
+end
+
+local function findStick()
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local vw, vh = cam.ViewportSize.X, cam.ViewportSize.Y
+    local best, bestS, cands = nil, 0, {}
+    local function scan(root)
+        for _, o in ipairs(root:GetDescendants()) do
+            if o:IsA("GuiObject") and not o:IsDescendantOf(gui) then
+                if STICK_NAME ~= "" then
+                    if o.Name == STICK_NAME then best, bestS = o, 999 end
+                else
+                    local ok, s = pcall(scoreStick, o, vw, vh)
+                    if ok and s > 0 then
+                        table.insert(cands, { o = o, s = s })
+                        if s > bestS then bestS, best = s, o end
+                    end
+                end
+            end
+        end
+    end
+    pcall(scan, PlayerGui)
+    pcall(scan, CoreGui)
+    table.sort(cands, function(a, b) return a.s > b.s end)
+    for i = 1, math.min(5, #cands) do
+        local c = cands[i]
+        print(string.format("[WK] 摇杆候选%d: %s (%s) 分%d @ %.0f,%.0f %.0fx%.0f",
+            i, c.o.Name, c.o.ClassName, c.s,
+            c.o.AbsolutePosition.X, c.o.AbsolutePosition.Y,
+            c.o.AbsoluteSize.X, c.o.AbsoluteSize.Y))
+    end
+    return best
+end
+
+local function bindStick()
+    stick = findStick()
+    if not stick then
+        print("[WK] 未找到摇杆控件 → 仅用 Seat/扭矩兜底; 把候选名字填进 STICK_NAME")
+        return
+    end
+    local ap, as = stick.AbsolutePosition, stick.AbsoluteSize
+    stickCenter  = Vector2.new(ap.X + as.X * 0.5, ap.Y + as.Y * 0.5)
+    stickRadius  = STICK_RADIUS > 0 and STICK_RADIUS or math.min(as.X, as.Y) * 0.45
+    stickHomePos = stick.Position
+    print(string.format("[WK] 摇杆锁定: %s 中心 %.0f,%.0f 半径 %.0f",
+        stick.Name, stickCenter.X, stickCenter.Y, stickRadius))
+    touchOK = false
+    if USE_TOUCH then
+        pcall(function() VIM = VIM or game:GetService("VirtualInputManager") end)
+        if VIM then
+            local a = pcall(function() VIM:SendTouchEvent(TOUCH_ID, S_BEGIN, stickCenter.X, stickCenter.Y) end)
+            local b = pcall(function() VIM:SendTouchEvent(TOUCH_ID, S_END, stickCenter.X, stickCenter.Y) end)
+            touchOK = a and b
+        end
+    end
+    print("[WK] 触摸注入: " .. (touchOK and "可用 (真实左右拖动)" or "不可用 → 降级为直接移动摇杆"))
+end
+
+local function applyStick(v)
+    if not stick or not stickCenter then return end
+    local x = stickCenter.X + v * stickRadius
+    local y = stickCenter.Y                        -- 只左右, 不碰油门
+    if touchOK then
+        if math.abs(v) < 0.05 then
+            if touchActive then
+                pcall(function() VIM:SendTouchEvent(TOUCH_ID, S_END, x, y) end)
+                touchActive = false
+            end
+        elseif not touchActive then
+            pcall(function()
+                VIM:SendTouchEvent(TOUCH_ID, S_BEGIN, stickCenter.X, stickCenter.Y)
+                VIM:SendTouchEvent(TOUCH_ID, S_CHANGE, x, y)
+            end)
+            touchActive = true
+        else
+            pcall(function() VIM:SendTouchEvent(TOUCH_ID, S_CHANGE, x, y) end)
+        end
+    else
+        pcall(function()
+            stick.Position = UDim2.new(stickHomePos.X.Scale, stickHomePos.X.Offset + v * stickRadius,
+                                       stickHomePos.Y.Scale, stickHomePos.Y.Offset)
+        end)
+    end
+end
+
+local function releaseStick()
+    if touchActive and VIM and stickCenter then
+        pcall(function() VIM:SendTouchEvent(TOUCH_ID, S_END, stickCenter.X, stickCenter.Y) end)
+    end
+    touchActive = false
+    if stick and stickHomePos and stick.Parent then
+        pcall(function() stick.Position = stickHomePos end)
+    end
+    stick, stickCenter, stickHomePos, stickRadius = nil, nil, nil, nil
+end
+
 local function findVehicle()
     local char = p.Character
     if not char then return nil end
@@ -368,6 +497,7 @@ local function autoTick()
     local target = raw * STEER_SIGN
     curSteer = curSteer + (target - curSteer) * STEER_SMOOTH
     applySteer(curSteer)
+    applyStick(curSteer * STICK_SIGN)
     doDrift(v.root, fw, curSteer)
     local turning = math.abs(target) > 0.2
     if turning ~= wasTurning then
@@ -379,6 +509,7 @@ end
 local function startAuto()
     if autoThread then return end
     autoAlive = true
+    pcall(bindStick)   -- 扫描并锁定屏幕摇杆 (开启时只做一次)
     autoThread = task.spawn(function()
         while autoAlive and AUTO_ON do
             pcall(autoTick)
@@ -388,6 +519,7 @@ local function startAuto()
 end
 local function stopAuto()
     autoAlive = false
+    pcall(releaseStick)
     if autoThread then pcall(function() task.cancel(autoThread) end); autoThread = nil end
     if steerConn then pcall(function() steerConn:Disconnect() end); steerConn = nil end
     lastSeat, rayParams, lastChar, lastModel = nil, nil, nil, nil
@@ -429,4 +561,4 @@ refresh()
 refreshAuto()
 enableView()
 
-print("WK 已就绪 (视野 + 自动转弯/漂移 V4 · 大幅转向防撞墙 · 零联网 · 低开销) [WK_VIEW_V4]")
+print("WK 已就绪 (视野 + 自动转弯 V5 · 直接驱动屏幕摇杆 · 零联网 · 低开销) [WK_VIEW_V5]")
