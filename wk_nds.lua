@@ -1,10 +1,14 @@
--- ===== WK 视野 (强制去雾 + 去黑夜 · 防闪烁 · 零联网秒启动) =====
+-- ===== WK 视野 (强制去雾 + 去黑夜 · 零联网秒启动 · 极低开销) =====
 -- 适用: 「不要停止 / make sure to drive fast」等雨夜浓雾黑夜驾驶地图
--- 只保留视野: 已按要求删除【怪物检测 / 三级测距 / 高亮 / 防怪推离 / 自动传送 / 诊断面板】全部逻辑
--- 特点: 不加载任何UI库 / 不联网 / 无启动动画 / 无常驻循环, 执行即出开关并生效
--- 防闪烁: 雾/暗化效果整体移出渲染树 + Lighting标量属性变更即时反制 (只写一次, 不与地图每帧对拉)
--- 单开关: 「WK 视野」一键开/关, 默认开启; 关闭恢复原始夜景
---   [WK_VIEW_V1]
+-- 只保留视野: 怪物检测 / 三级测距 / 高亮 / 防怪推离 / 自动传送 / 诊断面板 全部已删除
+-- V2「不卡」优化:
+--   ① 删除 Lighting/Camera 的 DescendantAdded 高频监听 —— 雨夜地图每帧新建雨滴/粒子会触发
+--      成百上千次回调, 这是卡顿主因; 改为「开关打开时扫一次 + 每 10 秒极低频巡检」
+--   ② stash 查重由线性遍历改字典 O(1), 并设上限, 防止对象表无限增长导致越玩越卡
+--   ③ 标量反制加 0.15s 节流, 杜绝与地图脚本互相改属性形成的乒乓死循环 (同时继续防闪)
+--   ④ 全程「一次性设置 + 事件驱动」, 完全不用 Heartbeat / RenderStepped / 每帧轮询
+-- 单开关: 默认开启(执行即去雾白昼), 点一下关闭并恢复原始夜景
+--   [WK_VIEW_V2]
 
 local Lighting  = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
@@ -13,7 +17,7 @@ local Players   = game:GetService("Players")
 local p         = Players.LocalPlayer
 local PlayerGui = p:WaitForChild("PlayerGui")
 
--- 防多开: 让上一份实例恢复夜景并销毁旧UI
+-- 防多开: 让上一份实例(含旧版心跳/扫描)彻底停下并恢复夜景
 if _G.WK_Day_Cleanup then pcall(_G.WK_Day_Cleanup) end
 for _, parent in ipairs({CoreGui, PlayerGui}) do
     for _, obj in ipairs(parent:GetChildren()) do
@@ -41,16 +45,22 @@ local FX = {
     Atmosphere = true, ColorCorrectionEffect = true, BlurEffect = true,
     DepthOfFieldEffect = true, SunRaysEffect = true, BloomEffect = true, Sky = true,
 }
-local GREEN = Color3.fromRGB(40, 175, 95)
-local DARK  = Color3.fromRGB(40, 44, 48)
+local GREEN          = Color3.fromRGB(40, 175, 95)
+local DARK           = Color3.fromRGB(40, 44, 48)
+local SWEEP_INTERVAL = 10    -- 秒; 极低频巡检间隔 (设 0 则完全不巡检, 最省)
+local FIX_THROTTLE   = 0.15  -- 秒; 同一属性写回最小间隔, 防跨脚本乒乓
+local STASH_MAX      = 200   -- 恢复表上限, 防止无限增长
 
 -- ==========================================
 -- 状态
 -- ==========================================
 local ON = true
 local dayOn = false
-local backup, stash = nil, {}
-local scalarConns, fxConns = {}, {}
+local backup = nil
+local stashMap, stashList = {}, {}   -- 字典查重 O(1) + 有序恢复表
+local scalarConns = {}
+local lastFix = {}
+local sweepThread, alive = nil, false
 
 local function setP(obj, prop, val) pcall(function() obj[prop] = val end) end
 local function getP(obj, prop)
@@ -99,12 +109,15 @@ local function refresh()
 end
 
 -- ==========================================
--- 视野: 去雾 + 去黑夜 (移出效果 + 标量反制) —— 原样保留
+-- 视野: 去雾 + 去黑夜 (移出效果 + 标量反制)
 -- ==========================================
 local function moveOut(obj)
-    for _, it in ipairs(stash) do if it.obj == obj then return end end
+    if stashMap[obj] then return end               -- O(1) 查重, 不再线性扫全表
     local par = obj.Parent
-    table.insert(stash, { obj = obj, parent = par })
+    if #stashList < STASH_MAX then                -- 表满仍移出(保证效果), 只是关闭时不恢复这些
+        stashMap[obj] = true
+        table.insert(stashList, { obj = obj, parent = par })
+    end
     pcall(function() obj.Parent = nil end)
 end
 local function sweepEffects()
@@ -119,12 +132,13 @@ local function sweepEffects()
     end
 end
 local function moveBackAll()
-    for _, it in ipairs(stash) do
+    for _, it in ipairs(stashList) do
         local ok = pcall(function() it.obj.Parent = it.parent or Lighting end)
         if not ok then pcall(function() it.obj.Parent = Lighting end) end
     end
-    stash = {}
+    stashMap, stashList = {}, {}
 end
+
 local function enableView()
     if dayOn then return end
     dayOn = true
@@ -132,38 +146,42 @@ local function enableView()
     for k in pairs(DAY) do backup[k] = getP(Lighting, k) end
     for k, v in pairs(DAY) do setP(Lighting, k, v) end   -- 首次写一次
     sweepEffects()                                       -- 雾/夜空/暗化效果移出渲染树
-    -- 标量: 只在被地图改动时即时写回 (零轮询, 渲染帧永远看到白天值)
+    -- 标量反制: 只在地图真的改动属性时触发; 节流防止与地图脚本乒乓死循环
     for k, v in pairs(DAY) do
         pcall(function()
             local c = Lighting:GetPropertyChangedSignal(k):Connect(function()
                 if not dayOn then return end
-                if not sameVal(getP(Lighting, k), v) then setP(Lighting, k, v) end
+                local now = os.clock()
+                if lastFix[k] and now - lastFix[k] < FIX_THROTTLE then return end
+                if not sameVal(getP(Lighting, k), v) then
+                    lastFix[k] = now
+                    setP(Lighting, k, v)
+                end
             end)
             table.insert(scalarConns, c)
         end)
     end
-    -- 地图动态新建的雾/暗化效果立刻移走
-    pcall(function()
-        table.insert(fxConns, Lighting.DescendantAdded:Connect(function(obj)
-            if dayOn and FX[obj.ClassName] then moveOut(obj) end
-        end))
-    end)
-    pcall(function()
-        local cam = Workspace.CurrentCamera
-        if cam then
-            table.insert(fxConns, cam.DescendantAdded:Connect(function(obj)
-                if dayOn and FX[obj.ClassName] then moveOut(obj) end
-            end))
-        end
-    end)
+    -- 极低频巡检: 兜底清掉地图后来新建的雾/暗化效果 (替代高频 DescendantAdded)
+    if SWEEP_INTERVAL > 0 then
+        alive = true
+        sweepThread = task.spawn(function()
+            while alive and dayOn do
+                task.wait(SWEEP_INTERVAL)
+                if not (alive and dayOn) then break end
+                pcall(sweepEffects)
+            end
+        end)
+    end
 end
+
 local function disableView()
     if not dayOn then return end
     dayOn = false
+    alive = false
+    if sweepThread then pcall(function() task.cancel(sweepThread) end); sweepThread = nil end
     for _, c in ipairs(scalarConns) do pcall(function() c:Disconnect() end) end
     scalarConns = {}
-    for _, c in ipairs(fxConns) do pcall(function() c:Disconnect() end) end
-    fxConns = {}
+    lastFix = {}
     if backup then
         for k, v in pairs(backup) do if v ~= nil then setP(Lighting, k, v) end end
         backup = nil
@@ -192,4 +210,4 @@ end
 refresh()
 enableView()
 
-print("WK 视野 已就绪 (仅去雾/白昼 · 防闪烁 · 零联网) [WK_VIEW_V1]")
+print("WK 视野 已就绪 (去雾/白昼 · 防闪 · 零联网 · 极低开销 V2) [WK_VIEW_V2]")
