@@ -1,20 +1,19 @@
--- ===== WK 视野 + 自动转弯 V7 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
+-- ===== WK 视野 + 自动转弯 V8 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
 -- 适用: 「不要停止 / make sure to drive fast」等雨夜浓雾黑夜驾驶地图
--- V7 是依据 V6【屏幕诊断的实测证据】重做, 不再凭猜测换控制通道:
---   诊断实录: 「座位 普通Seat | 无Float 每帧 / 目标 +0.00 读回 -」
---   [证据1] 这游戏不是 VehicleSeat, 连 SteerFloat 属性都不存在 → V6 写了个不存在的属性, 全废
---   [证据2] 目标恒 +0.00 → 旧版「向下打射线找路面」在整片大地地图上 9 个方向全部命中,
---           得分几乎相同 + 中心偏好 → 永远判直路, 一次方向都没打过。这是更致命的独立 Bug
--- V7 两项根本修复:
---   (1) 探路改为【水平前方障碍射线】: 从车头向 9 个方向打水平射线, 测「撞墙距离」(法线朝上
---       的地面不算障碍), 叠加远处地面连续性; 选最空的方向。前方近处有墙 → 立即满舵避险
---   (2) 转向输出改为【自适应取证 + 多通道并打】: 开启时扫描 PlayerGui/CoreGui 定位真实摇杆,
---       列出 ReplicatedStorage/车模型 的 RemoteEvent 与转向 Value; 驱动时按 触摸注入 /
---       firesignal / knob 位置 / 转向 Value / SteerFloat / 车身横摆 依次尝试, 每条通道的
---       成功与失败都显示在屏幕诊断里, 点「复制诊断」即可把完整对象清单粘贴出来
+-- V8 修正 V7 的实测问题:
+--   [问题1] 用户反馈「根本没有复制诊断」: V7 诊断框塞了 9 行文字 + TextWrapped 自动换行,
+--           在手机横屏上溢出屏幕底部, 把下方 y=278 的复制按钮整个挤出可视区 (截图实锤)
+--           → 诊断框压缩到 4 行 / 关闭换行 / 字号加大; 复制按钮上移并做成与主开关同宽的大按钮;
+--             诊断框本身也可点击; 复制后把完整报告【分页显示在屏幕上】, 不依赖剪贴板 API
+--   [问题2] V7 诊断泄露了关键事实: 摇杆真实对象名 = ThumbstickStart (Roblox 引擎自带动态触摸摇杆)
+--           → 说明转向输入走 UserInputService.TouchMoved, 不读 Value / knob.Position
+--           → 新增 firesignal(UserInputService.TouchMoved) 伪造触摸 + 触摸状态保持
+--   [问题3] 座位 普通Seat / 无 SteerFloat (V6 起已确认): 自定义车, 转向值多经 RemoteEvent 上报
+--           → 新增 __namecall 学习: 自动捕获游戏自己发的转向 FireServer(实例名+参数格式),
+--             之后用同样格式重放脚本算出的舵量; 学到的名字显示在诊断里, 无需用户截图/复制
 -- 视野逻辑原样保留: 删高频 DescendantAdded 监听 + 字典查重 + 反制节流 + 10 秒低频巡检
---   性能: 未开启零新增开销; 扫描只在开启/换车时做一次; 每帧仅几次属性赋值
---   [WK_VIEW_V7]
+--   性能: 未开启零新增开销; 扫描只在开启/换车时一次; 每帧仅几次属性赋值
+--   [WK_VIEW_V8]
 
 local Lighting  = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
@@ -76,9 +75,12 @@ local TORQUE_YAW     = 1.6
 -- ==========================================
 -- 配置: 转向输出 (V7 自适应取证 + 多通道)
 -- ==========================================
-local STICK_NAME     = ""    -- 留空=自动扫描; 诊断里看到正确对象名后填这里精确锁定
+local STICK_NAME     = "ThumbstickStart"  -- V7 诊断实测到的真实摇杆名 (Roblox 默认动态摇杆)
 local STICK_RADIUS   = 0     -- 0=按摇杆尺寸自动算; 也可填固定像素如 70
 local TRY_TOUCH      = true  -- VirtualInputManager 触摸注入 (带成功/失败回显)
+local TRY_UIS        = true  -- firesignal 伪造 UserInputService.TouchMoved (默认摇杆真正读的输入)
+local TRY_HOOK       = true  -- 自动学习游戏自己的转向 RemoteEvent 调用
+local TRY_REPLAY     = true  -- 用学到的格式重放转向值
 local TRY_FIRESIGNAL = true  -- firesignal 触发摇杆输入信号 (若执行器提供)
 local TRY_KNOB       = true  -- 直接移动 knob 位置 (降级)
 local TRY_VALUES     = true  -- 写名字含 steer/turn/方向 的 Value
@@ -117,7 +119,11 @@ local touchOK, touchSig, touchErr = false, 0, ""
 local touchDown, touchId = false, 9137
 local probeInfo = "探路 -"
 local fullReport = ""
+local reportLines, reportPage, showingReport = {}, 1, false
+local uisOK, hookOK, learnedName, learnedIdx = false, false, "-", 0
+local learnedRemote, learnedSample = nil, nil
 local updateDiag
+local getFireSignal          -- 前向声明: 供 applyFireSignal / applyUIS / bindVehicle 共用同一 upvalue
 
 local function setP(obj, prop, val) pcall(function() obj[prop] = val end) end
 local function getP(obj, prop)
@@ -158,41 +164,42 @@ end
 local btn     = mkBtn(0,  "WK 视野：关")
 local btnAuto = mkBtn(54, "自动转弯：关")
 
--- 屏幕诊断 (V7): 仅自动转弯开启时可见; 加大显示多通道状态
-local diag = Instance.new("TextLabel")
+-- ===== 屏幕诊断 (V8): 4 行 / 不换行 / 固定像素, 保证手机横屏完整可见 =====
+local diag = Instance.new("TextButton")       -- 改成按钮: 点诊断框本身也能复制/翻页
 diag.Name = "WK_Diag"
-diag.Size = UDim2.new(0, 272, 0, 170)
-diag.Position = UDim2.new(0, 12, 0.30, 106)
+diag.Size = UDim2.new(0, 272, 0, 92)
+diag.Position = UDim2.new(0, 12, 0.30, 160)
 diag.BackgroundColor3 = Color3.fromRGB(12, 16, 20)
-diag.BackgroundTransparency = 0.28
+diag.BackgroundTransparency = 0.22
 diag.BorderSizePixel = 0
-diag.Font = Enum.Font.Gotham
-diag.TextSize = 10
+diag.Font = Enum.Font.GothamBold
+diag.TextSize = 13
 diag.TextColor3 = Color3.fromRGB(170, 235, 185)
 diag.TextXAlignment = Enum.TextXAlignment.Left
 diag.TextYAlignment = Enum.TextYAlignment.Top
-diag.TextWrapped = true
+diag.TextWrapped = false                     -- 关键: 关掉自动换行, 杜绝溢出
 diag.Text = "诊断待开启"
 diag.Visible = false
 diag.Parent = gui
 pcall(function() Instance.new("UICorner", diag).CornerRadius = UDim.new(0, 8) end)
 
--- 一键复制完整取证报告 (手机端不用开控制台 / 不用截图)
+-- 复制按钮: 做成与两个主开关同宽的大按钮, 放在诊断框【上方】, 绝对不会掉出屏幕
 local copyBtn = Instance.new("TextButton")
 copyBtn.Name = "WK_Copy"
-copyBtn.Size = UDim2.new(0, 92, 0, 26)
-copyBtn.Position = UDim2.new(0, 12, 0.30, 278)
-copyBtn.BackgroundColor3 = DARK
+copyBtn.Size = UDim2.new(0, 148, 0, 44)
+copyBtn.Position = UDim2.new(0, 12, 0.30, 108)   -- 紧跟「自动转弯」(y=54, 高44) 之后
+copyBtn.BackgroundColor3 = Color3.fromRGB(60, 105, 190)
 copyBtn.BorderSizePixel = 0
 copyBtn.Font = Enum.Font.GothamBold
-copyBtn.Text = "复制诊断"
-copyBtn.TextColor3 = Color3.fromRGB(230, 230, 230)
-copyBtn.TextSize = 11
+copyBtn.Text = "复制诊断 / 翻页"
+copyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+copyBtn.TextSize = 13
 copyBtn.Visible = false
 copyBtn.Parent = gui
-pcall(function() Instance.new("UICorner", copyBtn).CornerRadius = UDim.new(0, 13) end)
+pcall(function() Instance.new("UICorner", copyBtn).CornerRadius = UDim.new(0, 22) end)
 
-copyBtn.Activated:Connect(function()
+-- 点击行为: 1) 尝试剪贴板  2) 无论如何把完整报告分页显示在诊断框(截图即可, 不依赖剪贴板)
+local function copyAndPage()
     local done = false
     pcall(function()
         local env = (type(getgenv) == "function") and getgenv() or _G
@@ -202,9 +209,25 @@ copyBtn.Activated:Connect(function()
             end
         end
     end)
-    copyBtn.Text = done and "已复制" or "无剪贴板"
-    task.delay(1.6, function() pcall(function() copyBtn.Text = "复制诊断" end) end)
-end)
+    local pages = math.max(1, math.ceil(#reportLines / 4))
+    if not showingReport then
+        showingReport = true
+        reportPage = 1
+    else
+        reportPage = reportPage + 1
+        if reportPage > pages then reportPage = 1 end
+    end
+    copyBtn.Text = "报告 " .. reportPage .. "/" .. pages ..
+        (done and " · 已复制" or " · 再点翻页")
+    if showingReport then
+        local from = (reportPage - 1) * 4 + 1
+        diag.Text = table.concat(reportLines, "\n", from, math.min(#reportLines, from + 3))
+    else
+        updateDiag(true)
+    end
+end
+copyBtn.Activated:Connect(copyAndPage)
+diag.Activated:Connect(copyAndPage)          -- 双保险: 点诊断框同样生效
 
 local function refresh()
     if ON then
@@ -550,14 +573,6 @@ local function releaseTouch()
     touchDown = false
 end
 
-local function getFireSignal()
-    if type(firesignal) == "function" then return firesignal end
-    local f
-    pcall(function()
-        if type(getgenv) == "function" then f = getgenv().firesignal end
-    end)
-    return f
-end
 local function applyFireSignal(v)
     if not TRY_FIRESIGNAL or not stick or not stickCenter then return end
     local fs = getFireSignal()
@@ -583,6 +598,114 @@ local function applyKnob(v)
 end
 local function restoreKnob()
     if stick and knobBase then pcall(function() stick.Position = knobBase end) end
+end
+
+-- V8: 伪造 UserInputService.TouchMoved (Roblox 默认动态摇杆 ThumbstickStart 真正读的输入)
+getFireSignal = function()
+    if type(firesignal) == "function" then return firesignal end
+    if type(fire_signal) == "function" then return fire_signal end
+    local f
+    pcall(function()
+        if type(getgenv) == "function" then
+            f = getgenv().firesignal or getgenv().fire_signal
+        end
+    end)
+    return f
+end
+local UIS = game:GetService("UserInputService")
+local uisDown = false
+local function applyUIS(v)
+    if not TRY_UIS or not stickCenter then return end
+    local fs = getFireSignal()
+    if type(fs) ~= "function" then uisOK = false; return end
+    local x = stickCenter.X + v * stickRadius * STICK_SIGN
+    local y = stickCenter.Y
+    local function fake(state, px, py)
+        return {
+            Position = Vector3.new(px, py, 0),
+            Delta = Vector3.new(v * 3, 0, 0),
+            UserInputType = Enum.UserInputType.Touch,
+            UserInputState = state,
+            KeyCode = Enum.KeyCode.Unknown,
+        }
+    end
+    local ok = pcall(function()
+        if not uisDown then
+            fs(UIS.TouchStarted, fake(Enum.UserInputState.Begin, stickCenter.X, y), false)
+            uisDown = true
+        end
+        fs(UIS.TouchMoved, fake(Enum.UserInputState.Change, x, y), false)
+    end)
+    uisOK = ok
+end
+local function releaseUIS()
+    if uisDown then
+        local fs = getFireSignal()
+        if type(fs) == "function" and stickCenter then
+            pcall(function()
+                fs(UIS.TouchEnded, {
+                    Position = Vector3.new(stickCenter.X, stickCenter.Y, 0),
+                    UserInputType = Enum.UserInputType.Touch,
+                    UserInputState = Enum.UserInputState.End,
+                    KeyCode = Enum.KeyCode.Unknown,
+                }, false)
+            end)
+        end
+        uisDown = false
+    end
+end
+
+-- V8: 自动学习游戏自己的转向 RemoteEvent (无需用户截图 / 复制 / 看控制台)
+local installHook
+installHook = function()
+    if hookOK or not TRY_HOOK then return end
+    if not (type(hookmetamethod) == "function" and type(getnamecallmethod) == "function"
+            and type(newcclosure) == "function") then return end
+    pcall(function()
+        -- 跨实例复用: 重复执行脚本时, 沿用上一份实例已学到的转向 Remote
+        if _G.WK_HookInstalled then
+            hookOK = true
+            if _G.WK_Learned then
+                learnedRemote = _G.WK_Learned.remote or learnedRemote
+                learnedIdx    = _G.WK_Learned.idx or learnedIdx
+                learnedSample = _G.WK_Learned.sample or learnedSample
+                learnedName   = _G.WK_Learned.name or learnedName
+            end
+            return
+        end
+        local old
+        old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+            local m = getnamecallmethod()
+            if m == "FireServer" and typeof(self) == "Instance" then
+                local args = {...}
+                -- 只学「-1~1 之间的非整数小数」: 模拟转向的典型特征
+                -- 排除 0 / ±1 等整数, 否则大量带 id/标志位的 Remote 会被误学 (实测踩过)
+                for i, a in ipairs(args) do
+                    if type(a) == "number" and a ~= 0 and math.abs(a) <= 1.001
+                       and a ~= math.floor(a) then
+                        learnedRemote, learnedIdx = self, i
+                        learnedSample = args
+                        learnedName = self.Name .. "#" .. i
+                        _G.WK_Learned = { remote = self, idx = i, sample = args,
+                                          name = learnedName }
+                        break
+                    end
+                end
+            end
+            return old(self, ...)
+        end))
+        if old then hookOK = true; _G.WK_HookInstalled = true end
+    end)
+end
+
+local function replayLearned(v)
+    if not TRY_REPLAY or not learnedRemote or not learnedSample then return end
+    pcall(function()
+        local args = {}
+        for i = 1, #learnedSample do args[i] = learnedSample[i] end
+        args[learnedIdx] = v
+        learnedRemote:FireServer(table.unpack(args, 1, #args))
+    end)
 end
 
 local function applyValues(v)
@@ -639,6 +762,8 @@ local function bindVehicle(v)
     findStick(vp.X, vp.Y)
     findObjects()
     detectTouch()
+    installHook()
+    pcall(function() uisOK = (type(getFireSignal()) == "function") end)
     updateDiag(true)
 end
 
@@ -655,39 +780,33 @@ updateDiag = function(force)
     local now = os.clock()
     if not force and now - diagT < 0.3 then return end
     diagT = now
-    local seatType = veh and (veh.isVehicleSeat and "VehicleSeat"
-        or ("普通" .. (veh.rawSeat and veh.rawSeat.ClassName or "Seat"))) or "未坐车"
-    local readback = "-"
-    if veh then
-        local ok, val = pcall(function() return veh.seat.SteerFloat end)
-        if ok and type(val) == "number" then readback = string.format("%+.2f", val) end
-    end
-    local stickTxt = "-"
-    if stick and stickCenter then
-        stickTxt = string.format("%s @%.0f,%.0f R%.0f",
-            stick.Name, stickCenter.X, stickCenter.Y, stickRadius)
-    end
-    diag.Text = string.format(
-        "座位 %s | %s\n探路 %s\n目标 %+.2f 读回 %s\n摇杆 %s\n触摸 %s | 信号 %s\n通道 knob %s / Val %s / 扭矩 %s\n候选摇杆 %d | Remote %d | Value %d\n点「复制诊断」粘贴完整清单",
-        seatType, chanSeat, probeInfo, curSteer, readback, stickTxt,
-        chanTouch, chanFire, chanKnob, chanVal, (TRY_TORQUE and "开" or "关"),
-        #stickCands, #remoteObjs, #stickVals)
+    local seatType = veh and (veh.isVehicleSeat and "VehicleSeat" or "普通Seat") or "未坐车"
+    -- 屏幕 4 行 (不换行, 固定像素, 保证完整可见)
+    local l1 = string.format("座位 %s | 目标 %+.2f", seatType, curSteer)
+    local l2 = probeInfo
+    local l3 = string.format("摇杆 %s | 触摸 %s",
+        (stick and stick.Name) or "未锁定", chanTouch)
+    local l4 = string.format("UIS %s | 学习 %s | 候选 R%d V%d",
+        (uisOK and "可用" or "不可用"), learnedName, #remoteObjs, #stickVals)
+    if not showingReport then diag.Text = l1 .. "\n" .. l2 .. "\n" .. l3 .. "\n" .. l4 end
+
+    -- 完整报告 (点「复制诊断 / 翻页」会分页显示在屏幕上, 不依赖剪贴板)
     local L = {}
     local function add(x) L[#L + 1] = x end
-    add("=== WK V7 诊断报告 (整段粘贴给我) ===")
-    add("座位: " .. seatType .. " | 车模型: " .. ((veh and veh.model and veh.model.Name) or "无"))
+    add("=== WK V8 报告 (点按钮翻页看全) ===")
+    add(l1); add(l2); add(l3); add(l4)
+    add("座位属性: " .. chanSeat .. " | firesignal: " .. chanFire)
+    add("通道 knob " .. chanKnob .. " / Val " .. chanVal)
+    add("车模型: " .. ((veh and veh.model and veh.model.Name) or "无"))
     add("车身部件: " .. ((veh and veh.body and veh.body.Name) or "无PrimaryPart"))
-    add("座位属性: " .. chanSeat .. " | 读回 " .. readback)
-    add("探路: " .. probeInfo .. " | 当前目标 " .. string.format("%+.2f", curSteer))
-    add("摇杆锁定: " .. stickTxt)
-    add("触摸注入: " .. chanTouch .. " " .. touchErr)
-    add("firesignal: " .. chanFire)
+    add("摇杆中心: " .. ((stickCenter and string.format("%.0f,%.0f R%.0f",
+        stickCenter.X, stickCenter.Y, stickRadius)) or "-"))
     add("--- 摇杆候选 (" .. #stickCands .. ") ---")
-    for i, x in ipairs(stickCands) do if i <= 12 then add(x) end end
+    for i, x in ipairs(stickCands) do if i <= 10 then add(x) end end
     add("--- RemoteEvent (" .. #remoteNames .. ") ---")
-    for i, x in ipairs(remoteNames) do if i <= 50 then add(x) end end
+    for i, x in ipairs(remoteNames) do if i <= 40 then add(x) end end
     add("--- 转向 Value (" .. #valueNames .. ") ---")
-    for i, x in ipairs(valueNames) do if i <= 12 then add(x) end end
+    for i, x in ipairs(valueNames) do if i <= 10 then add(x) end end
     add("--- ScreenGui ---")
     pcall(function()
         for _, parent in ipairs({PlayerGui, CoreGui}) do
@@ -698,8 +817,15 @@ updateDiag = function(force)
             end
         end
     end)
-    add("=== 把以上全部粘贴给我即可 ===")
+    add("=== 学到 " .. learnedName .. " | 报告共 " .. #L .. " 行 ===")
+    reportLines = L
     fullReport = table.concat(L, "\n")
+    if showingReport then
+        local from = (reportPage - 1) * 4 + 1
+        local pages = math.max(1, math.ceil(#reportLines / 4))
+        if reportPage > pages then reportPage = 1; from = 1 end
+        diag.Text = table.concat(reportLines, "\n", from, math.min(#reportLines, from + 3))
+    end
 end
 
 -- 漂移: 高速急弯叠加横向滑移 + 横摆 (best-effort)
@@ -748,6 +874,8 @@ local function autoTick()
     writeSeat(curSteer)
     applyValues(curSteer)
     applyTouch(curSteer)
+    applyUIS(curSteer)
+    replayLearned(curSteer)
     applyFireSignal(curSteer)
     applyKnob(curSteer)
     doDrift(v.root, fw, curSteer)
@@ -765,6 +893,9 @@ local function startAuto()
     autoAlive = true
     diag.Visible = DIAG
     copyBtn.Visible = DIAG
+    copyBtn.Text = "复制诊断 / 翻页"
+    showingReport, reportPage = false, 1
+    installHook()
     startFrameWriter()
     updateDiag(true)
     autoThread = task.spawn(function()
@@ -780,6 +911,7 @@ local function stopAuto()
     if floatConn then pcall(function() floatConn:Disconnect() end); floatConn = nil end
     if autoThread then pcall(function() task.cancel(autoThread) end); autoThread = nil end
     releaseTouch()
+    releaseUIS()
     restoreKnob()
     lastSeat, rayParams, lastChar, lastModel = nil, nil, nil, nil
     wasTurning = false
@@ -791,6 +923,7 @@ local function stopAuto()
     veh = nil
     diag.Visible = false
     copyBtn.Visible = false
+    showingReport, reportPage = false, 1
 end
 
 -- ==========================================
@@ -823,4 +956,4 @@ refresh()
 refreshAuto()
 enableView()
 
-print("WK 已就绪 (视野 + 自动转弯 V7 · 水平障碍探路 · 自适应取证 · 零联网) [WK_VIEW_V7]")
+print("WK 已就绪 (视野 + 自动转弯 V8 · 诊断UI修复 · ThumbstickStart通道 · 零联网) [WK_VIEW_V8]")
