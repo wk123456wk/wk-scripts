@@ -1,15 +1,15 @@
--- ===== WK 视野 + 自动转弯 V5 (去雾白昼 · 直接驱动屏幕摇杆 · 零联网秒启动) =====
+-- ===== WK 视野 + 自动转弯 V6 (去雾白昼 · 直写 VehicleSeat 摇杆输出 · 零联网秒启动) =====
 -- 适用: 「不要停止 / make sure to drive fast」等雨夜浓雾黑夜驾驶地图
--- V5 关键修正: 该游戏转向【不读 VehicleSeat.Steer】, 而是读左下角虚拟摇杆的左右拖动,
---   所以 V3/V4 写 Steer / 车身扭矩全部落空。V5 改为直接驱动那个摇杆:
---   1) 自动扫描 PlayerGui / CoreGui, 按名字+左下角位置+圆形尺寸锁定摇杆 knob
---   2) 优先用 VirtualInputManager 注入真实触摸拖动 (Begin/Change/End), 只动 X 轴不碰油门
---   3) 触摸注入不可用时自动降级为直接移动 knob.Position (覆盖"每帧读位置"的实现)
---   4) 保留 Seat.Steer / 扭矩兜底, 以及 V4 全部弯道决策 (宽扇区/提前预判/满舵避险)
---   诊断: 开启时控制台打印摇杆候选、锁定结果、注入方式; 找错可把名字填进 STICK_NAME
---   性能: 未开启时【零新增开销】; 开启后只扫描一次, 每 0.08 秒 1 次触摸/属性写, 无每帧循环
+-- V6 修正依据 (Roblox 官方 VehicleSeat 文档):
+--   * Steer 是 int(1/0/-1) 且已弃用; 移动端摇杆的模拟转向写入的是 SteerFloat (float, 1右~-1左)
+--   * 二者 ReadWrite / security None, 且 "Will refresh back to 0 unless constantly set"
+--   * VirtualInputManager 是内部服务(RobloxScriptSecurity), 普通脚本无法注入触摸 → 放弃 V5 方案
+--   实现: 找到 VehicleSeat → 写 SteerFloat + Steer → Heartbeat 每帧持续写 + 属性变更即时写回
+--   兜底: 非 VehicleSeat 的车, 写车模型内可疑转向 Value/HingeConstraint + 车身横摆扭矩
+--   诊断: 开启后屏幕左上角显示 座位类型 / 目标舵 / SteerFloat 读回值 / 候选对象名 (截图即可)
+--   性能: 未开启时零新增开销; 开启后每帧仅几次属性赋值, 无全图遍历, 无每帧射线
 -- 视野逻辑原样保留: 删高频 DescendantAdded 监听 + 字典查重 + 反制节流 + 10 秒低频巡检
---   [WK_VIEW_V5]
+--   [WK_VIEW_V6]
 
 local Lighting  = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
@@ -51,7 +51,7 @@ local FIX_THROTTLE   = 0.15  -- 秒; 属性写回最小间隔, 防乒乓
 local STASH_MAX      = 200
 
 -- ==========================================
--- 配置: 自动转弯 / 漂移  (V4: 大幅转向 + 提前预判 + 前方避险)
+-- 配置: 自动转弯 / 漂移  (V4 弯道决策原样保留)
 -- ==========================================
 local AUTO_TICK      = 0.08  -- 秒; 路面探测间隔 (提高响应, 仍非每帧)
 local PROBE_ANGLES   = {-75, -50, -28, -12, 0, 12, 28, 50, 75}  -- 度; 宽扇区, 覆盖急弯/直角弯
@@ -69,13 +69,13 @@ local DRIFT_YAW      = 0.8   -- 漂移附加横摆
 local TORQUE_YAW     = 1.6   -- 扭矩兜底模式的横摆角速度
 
 -- ==========================================
--- 配置: 屏幕摇杆驱动 (V5 主通道)
+-- 配置: 转向输出 (V6 主通道, 依据 Roblox 官方 VehicleSeat 文档)
 -- ==========================================
-local STICK_NAME     = ""    -- 留空=自动发现; 自动找错时把控制台打印的名字填这里
-local STICK_SIGN     = 1     -- 若摇杆往反方向拖(拐反了), 把这里改成 -1
-local STICK_RADIUS   = 0     -- 0=按摇杆尺寸自动算; 也可填固定像素(如 60)
-local TOUCH_ID       = 9917  -- 虚拟触摸 id, 避开玩家真实触摸
-local USE_TOUCH      = true  -- 关掉则只用"直接移动 knob"通道
+local WRITE_FLOAT    = true   -- 写 SteerFloat (移动端摇杆的模拟转向值, float 1~-1)
+local WRITE_INT      = true   -- 同时写 Steer (int 1/0/-1, 兼容老式脚本)
+local EVERY_FRAME    = true   -- 每帧持续写 (官方: 不持续设置会刷回 0)
+local HINGE_ANGLE    = 30    -- 自定义车伺服转向铰链的满舵角度
+local DIAG           = true   -- 屏幕诊断 (确认工作后可改 false 隐藏)
 
 -- ==========================================
 -- 状态
@@ -91,13 +91,11 @@ local sweepThread, alive = nil, false
 local curSteer = 0
 local autoThread, autoAlive = nil, false
 local veh, rayParams, lastChar, lastModel = nil, nil, nil, nil
-local steerConn, lastSeat, ctrlMode = nil, nil, nil
+local floatConn, frameConn, lastSeat = nil, nil, nil
+local floatOK, intOK = false, false
+local carValues, carNames = {}, {}
 local wasTurning = false
-local stick, stickCenter, stickHomePos, stickRadius = nil, nil, nil, nil
-local touchActive, touchOK, VIM = false, false, nil
-local S_BEGIN  = Enum.UserInputState.Begin.Value
-local S_CHANGE = Enum.UserInputState.Change.Value
-local S_END    = Enum.UserInputState.End.Value
+local diagT = 0
 
 local function setP(obj, prop, val) pcall(function() obj[prop] = val end) end
 local function getP(obj, prop)
@@ -137,6 +135,25 @@ local function mkBtn(y, txt)
 end
 local btn     = mkBtn(0,  "WK 视野：关")
 local btnAuto = mkBtn(54, "自动转弯：关")
+
+-- 屏幕诊断: 仅自动转弯开启时可见; 手机端不用开控制台, 直接截图即可
+local diag = Instance.new("TextLabel")
+diag.Name = "WK_Diag"
+diag.Size = UDim2.new(0, 236, 0, 78)
+diag.Position = UDim2.new(0, 12, 0.30, 106)
+diag.BackgroundColor3 = Color3.fromRGB(12, 16, 20)
+diag.BackgroundTransparency = 0.35
+diag.BorderSizePixel = 0
+diag.Font = Enum.Font.Gotham
+diag.TextSize = 11
+diag.TextColor3 = Color3.fromRGB(170, 235, 185)
+diag.TextXAlignment = Enum.TextXAlignment.Left
+diag.TextYAlignment = Enum.TextYAlignment.Top
+diag.TextWrapped = true
+diag.Text = "诊断待开启"
+diag.Visible = false
+diag.Parent = gui
+pcall(function() Instance.new("UICorner", diag).CornerRadius = UDim.new(0, 8) end)
 
 local function refresh()
     if ON then
@@ -239,131 +256,32 @@ local function disableView()
 end
 
 -- ==========================================
--- 能力B: 自动转弯 + 漂移
+-- 能力B: 自动转弯 + 漂移  (V6: 直写 VehicleSeat 摇杆输出属性)
 -- ==========================================
+local RunService = game:GetService("RunService")
 
--- === 屏幕摇杆驱动 (V5 主通道) ===
-local STICK_KEY = {
-    stick=1, joystick=1, joy=1, wheel=1, steer=1, thumb=1, pad=1, knob=1,
-    drag=1, dial=1, turn=1, direction=1, left=1, handle=1, circle=1,
-}
-local function scoreStick(o, vw, vh)
-    if not o.Visible then return -1 end
-    local ap, as = o.AbsolutePosition, o.AbsoluteSize
-    if as.X < 30 or as.X > 320 or as.Y < 30 or as.Y > 320 then return -1 end
-    local s = 0
-    local n = o.Name:lower()
-    for k in pairs(STICK_KEY) do if n:find(k, 1, true) then s = s + 6 break end end
-    if ap.X < vw * 0.45 and ap.Y > vh * 0.45 then s = s + 5 end
-    local r = as.X / as.Y
-    if r > 0.65 and r < 1.5 then s = s + 3 end
-    if as.X >= 45 and as.X <= 140 then s = s + 3 elseif as.X > 220 then s = s - 2 end
-    if o:IsA("ImageButton") or o:IsA("TextButton") or o:IsA("ImageLabel") then s = s + 2 end
-    return s
-end
-
-local function findStick()
-    local cam = Workspace.CurrentCamera
-    if not cam then return nil end
-    local vw, vh = cam.ViewportSize.X, cam.ViewportSize.Y
-    local best, bestS, cands = nil, 0, {}
-    local function scan(root)
-        for _, o in ipairs(root:GetDescendants()) do
-            if o:IsA("GuiObject") and not o:IsDescendantOf(gui) then
-                if STICK_NAME ~= "" then
-                    if o.Name == STICK_NAME then best, bestS = o, 999 end
-                else
-                    local ok, s = pcall(scoreStick, o, vw, vh)
-                    if ok and s > 0 then
-                        table.insert(cands, { o = o, s = s })
-                        if s > bestS then bestS, best = s, o end
-                    end
-                end
-            end
-        end
-    end
-    pcall(scan, PlayerGui)
-    pcall(scan, CoreGui)
-    table.sort(cands, function(a, b) return a.s > b.s end)
-    for i = 1, math.min(5, #cands) do
-        local c = cands[i]
-        print(string.format("[WK] 摇杆候选%d: %s (%s) 分%d @ %.0f,%.0f %.0fx%.0f",
-            i, c.o.Name, c.o.ClassName, c.s,
-            c.o.AbsolutePosition.X, c.o.AbsolutePosition.Y,
-            c.o.AbsoluteSize.X, c.o.AbsoluteSize.Y))
-    end
-    return best
-end
-
-local function bindStick()
-    stick = findStick()
-    if not stick then
-        print("[WK] 未找到摇杆控件 → 仅用 Seat/扭矩兜底; 把候选名字填进 STICK_NAME")
-        return
-    end
-    local ap, as = stick.AbsolutePosition, stick.AbsoluteSize
-    stickCenter  = Vector2.new(ap.X + as.X * 0.5, ap.Y + as.Y * 0.5)
-    stickRadius  = STICK_RADIUS > 0 and STICK_RADIUS or math.min(as.X, as.Y) * 0.45
-    stickHomePos = stick.Position
-    print(string.format("[WK] 摇杆锁定: %s 中心 %.0f,%.0f 半径 %.0f",
-        stick.Name, stickCenter.X, stickCenter.Y, stickRadius))
-    touchOK = false
-    if USE_TOUCH then
-        pcall(function() VIM = VIM or game:GetService("VirtualInputManager") end)
-        if VIM then
-            local a = pcall(function() VIM:SendTouchEvent(TOUCH_ID, S_BEGIN, stickCenter.X, stickCenter.Y) end)
-            local b = pcall(function() VIM:SendTouchEvent(TOUCH_ID, S_END, stickCenter.X, stickCenter.Y) end)
-            touchOK = a and b
-        end
-    end
-    print("[WK] 触摸注入: " .. (touchOK and "可用 (真实左右拖动)" or "不可用 → 降级为直接移动摇杆"))
-end
-
-local function applyStick(v)
-    if not stick or not stickCenter then return end
-    local x = stickCenter.X + v * stickRadius
-    local y = stickCenter.Y                        -- 只左右, 不碰油门
-    if touchOK then
-        if math.abs(v) < 0.05 then
-            if touchActive then
-                pcall(function() VIM:SendTouchEvent(TOUCH_ID, S_END, x, y) end)
-                touchActive = false
-            end
-        elseif not touchActive then
-            pcall(function()
-                VIM:SendTouchEvent(TOUCH_ID, S_BEGIN, stickCenter.X, stickCenter.Y)
-                VIM:SendTouchEvent(TOUCH_ID, S_CHANGE, x, y)
-            end)
-            touchActive = true
-        else
-            pcall(function() VIM:SendTouchEvent(TOUCH_ID, S_CHANGE, x, y) end)
-        end
-    else
-        pcall(function()
-            stick.Position = UDim2.new(stickHomePos.X.Scale, stickHomePos.X.Offset + v * stickRadius,
-                                       stickHomePos.Y.Scale, stickHomePos.Y.Offset)
-        end)
-    end
-end
-
-local function releaseStick()
-    if touchActive and VIM and stickCenter then
-        pcall(function() VIM:SendTouchEvent(TOUCH_ID, S_END, stickCenter.X, stickCenter.Y) end)
-    end
-    touchActive = false
-    if stick and stickHomePos and stick.Parent then
-        pcall(function() stick.Position = stickHomePos end)
-    end
-    stick, stickCenter, stickHomePos, stickRadius = nil, nil, nil, nil
-end
-
+-- 找座位: 优先真正的 VehicleSeat (摇杆输出写在这里), 否则退回 SeatPart
 local function findVehicle()
     local char = p.Character
     if not char then return nil end
     local hum = char:FindFirstChildOfClass("Humanoid")
     local seat = hum and hum.SeatPart
     if not seat or not seat.Parent then return nil end
-    return { seat = seat, model = seat:FindFirstAncestorOfClass("Model"), root = seat, char = char }
+    local model = seat:FindFirstAncestorOfClass("Model")
+    local vs = nil
+    if seat:IsA("VehicleSeat") then vs = seat end
+    if not vs and model then
+        pcall(function() vs = model:FindFirstChildWhichIsA("VehicleSeat", true) end)
+    end
+    if not vs then
+        pcall(function()
+            local par = seat.Parent
+            if par then vs = par:FindFirstChildWhichIsA("VehicleSeat", true) end
+        end)
+    end
+    local target = vs or seat
+    return { seat = target, rawSeat = seat, isVehicleSeat = vs ~= nil,
+             model = model, root = target, char = char }
 end
 
 -- 射线过滤: 排除自己的角色 / 车, 否则会打到自己的车顶
@@ -421,40 +339,109 @@ local function probeRoad(root, fw)
     return bestDeg, bestScore, not frontNearOK
 end
 
--- 自适应控制方式: 能写 VehicleSeat.Steer 就用它, 否则扭矩兜底
-local function bindSeat(seat)
-    if lastSeat == seat and ctrlMode then return end
-    if steerConn then pcall(function() steerConn:Disconnect() end); steerConn = nil end
-    lastSeat = seat
-    local ok = pcall(function() local _ = seat.Steer; seat.Steer = 0 end)
-    if ok then
-        ctrlMode = "seat"
-        -- 游戏输入系统每帧会把 Steer 清成 0; 用属性变更事件即时写回, 无需每帧循环
-        pcall(function()
-            steerConn = seat:GetPropertyChangedSignal("Steer"):Connect(function()
-                if not AUTO_ON or ctrlMode ~= "seat" then return end
-                if math.abs(seat.Steer - curSteer) > 0.02 then
-                    pcall(function() seat.Steer = curSteer end)
+-- === V6 转向输出 ===
+local VALUE_KEY = {
+    steer=1, turn=1, input=1, direction=1, dir=1, angle=1, wheel=1, yaw=1,
+    ["转向"]=1, ["方向"]=1, ["角度"]=1,
+}
+
+-- 扫描车模型内可疑的转向值对象 (仅换车时一次; 只收看起来像输入量的)
+local function scanCarValues(model)
+    carValues, carNames = {}, {}
+    if not model then return end
+    pcall(function()
+        for _, o in ipairs(model:GetDescendants()) do
+            local isHinge = (o.ClassName == "HingeConstraint")
+            local isVal   = o:IsA("NumberValue") or o:IsA("IntValue")
+            if isHinge or isVal then
+                local n = o.Name:lower()
+                local match = false
+                for k in pairs(VALUE_KEY) do if n:find(k, 1, true) then match = true break end end
+                if match and (isHinge or (type(o.Value) == "number" and math.abs(o.Value) <= 1.01)) then
+                    table.insert(carValues, o)
+                    table.insert(carNames, o.Name)
                 end
-            end)
-        end)
-        print("[WK] 车辆控制: VehicleSeat.Steer")
-    else
-        ctrlMode = "torque"
-        print("[WK] 车辆控制: 自定义车 → 横摆扭矩兜底")
-    end
+            end
+            if #carValues >= 8 then break end
+        end
+    end)
 end
 
-local function applySteer(v)
-    if not veh then return end
-    if ctrlMode == "seat" then
-        pcall(function() veh.seat.Steer = v end)
-    else
+-- 真正的输出: 写 SteerFloat (模拟) + Steer (整数) + 自定义车兜底
+local function writeSeat(v)
+    if not veh or not veh.seat then return end
+    local s = veh.seat
+    if WRITE_FLOAT then pcall(function() s.SteerFloat = v end) end
+    if WRITE_INT   then pcall(function() s.Steer = (v > 0.15 and 1 or (v < -0.15 and -1 or 0)) end) end
+    if not veh.isVehicleSeat then
+        for _, o in ipairs(carValues) do
+            pcall(function()
+                if o:IsA("NumberValue") or o:IsA("IntValue") then
+                    o.Value = v
+                elseif o.ClassName == "HingeConstraint" then
+                    o.TargetAngle = v * HINGE_ANGLE
+                end
+            end)
+        end
         pcall(function()
             local av = veh.root.AssemblyAngularVelocity
             veh.root.AssemblyAngularVelocity = Vector3.new(av.X, v * TORQUE_YAW, av.Z)
         end)
     end
+end
+
+-- 绑定座位: 探测可写属性 + 属性变更即时写回 + 扫描候选 (换车才重做)
+local function bindVehicle(v)
+    if lastSeat == v.seat then return end
+    lastSeat = v.seat
+    if floatConn then pcall(function() floatConn:Disconnect() end); floatConn = nil end
+    floatOK = pcall(function() local _ = v.seat.SteerFloat; v.seat.SteerFloat = 0 end)
+    intOK   = pcall(function() local _ = v.seat.Steer; v.seat.Steer = 0 end)
+    if floatOK then
+        -- 引擎每帧把 SteerFloat 清成 0 时立刻压回, 不靠轮询
+        pcall(function()
+            floatConn = v.seat:GetPropertyChangedSignal("SteerFloat"):Connect(function()
+                if not AUTO_ON then return end
+                local ok, cur = pcall(function() return v.seat.SteerFloat end)
+                if ok and type(cur) == "number" and math.abs(cur - curSteer) > 0.02 then
+                    pcall(function() v.seat.SteerFloat = curSteer end)
+                end
+            end)
+        end)
+    end
+    scanCarValues(v.model)
+end
+
+-- 每帧持续写 (官方要求 constantly set; 回调只有几次属性赋值, 不遍历不射线)
+local function startFrameWriter()
+    if not EVERY_FRAME or frameConn then return end
+    frameConn = RunService.Heartbeat:Connect(function()
+        if not AUTO_ON or not veh then return end
+        pcall(writeSeat, curSteer)
+    end)
+end
+
+-- 屏幕诊断: 读回 SteerFloat 与目标的差, 一眼看出写入是否被接受
+local function updateDiag(force)
+    if not DIAG then return end
+    local now = os.clock()
+    if not force and now - diagT < 0.3 then return end
+    diagT = now
+    local seatType, readback = "未坐车", "-"
+    if veh then
+        seatType = veh.isVehicleSeat and "VehicleSeat"
+            or ("普通" .. (veh.rawSeat and veh.rawSeat.ClassName or "Seat"))
+        local ok, val = pcall(function() return veh.seat.SteerFloat end)
+        if ok and type(val) == "number" then readback = string.format("%+.2f", val) end
+    end
+    local ch = (floatOK and "Float" or "无Float") .. (intOK and "+Int" or "")
+        .. (EVERY_FRAME and " 每帧" or "")
+    local names = "无"
+    if #carNames > 0 then names = table.concat(carNames, ",", 1, math.min(3, #carNames)) end
+    diag.Text = string.format("座位 %s | %s\n目标 %+.2f  读回 %s\n候选 %s\n%s",
+        seatType, ch, curSteer, readback, names,
+        (veh and veh.isVehicleSeat) and "读回≈目标 → 写入成功"
+            or "非VehicleSeat/写入被覆盖 → 截图发我")
 end
 
 -- 漂移: 高速急弯时叠加横向滑移 + 横摆 (best-effort, pcall 兜底不影响主转向)
@@ -476,10 +463,11 @@ local function autoTick()
     local v = findVehicle()
     if not v then
         curSteer = curSteer * 0.7   -- 没坐车/角色未就绪: 缓慢回正
+        updateDiag()
         return
     end
     veh = v
-    bindSeat(v.seat)
+    bindVehicle(v)
     local fw = forwardOf(v.root)
     local deg, score, blocked = probeRoad(v.root, fw)
     local raw = 0
@@ -496,9 +484,9 @@ local function autoTick()
     end
     local target = raw * STEER_SIGN
     curSteer = curSteer + (target - curSteer) * STEER_SMOOTH
-    applySteer(curSteer)
-    applyStick(curSteer * STICK_SIGN)
+    writeSeat(curSteer)
     doDrift(v.root, fw, curSteer)
+    updateDiag()
     local turning = math.abs(target) > 0.2
     if turning ~= wasTurning then
         wasTurning = turning
@@ -509,7 +497,9 @@ end
 local function startAuto()
     if autoThread then return end
     autoAlive = true
-    pcall(bindStick)   -- 扫描并锁定屏幕摇杆 (开启时只做一次)
+    diag.Visible = DIAG
+    startFrameWriter()
+    updateDiag(true)
     autoThread = task.spawn(function()
         while autoAlive and AUTO_ON do
             pcall(autoTick)
@@ -519,16 +509,18 @@ local function startAuto()
 end
 local function stopAuto()
     autoAlive = false
-    pcall(releaseStick)
+    if frameConn then pcall(function() frameConn:Disconnect() end); frameConn = nil end
+    if floatConn then pcall(function() floatConn:Disconnect() end); floatConn = nil end
     if autoThread then pcall(function() task.cancel(autoThread) end); autoThread = nil end
-    if steerConn then pcall(function() steerConn:Disconnect() end); steerConn = nil end
     lastSeat, rayParams, lastChar, lastModel = nil, nil, nil, nil
     wasTurning = false
-    if veh and ctrlMode == "seat" and veh.seat and veh.seat.Parent then
+    if veh and veh.seat and veh.seat.Parent then
+        pcall(function() if floatOK then veh.seat.SteerFloat = 0 end end)
         pcall(function() veh.seat.Steer = 0 end)   -- 关掉后方向归零, 交还玩家
     end
     curSteer = 0
     veh = nil
+    diag.Visible = false
 end
 
 -- ==========================================
@@ -561,4 +553,4 @@ refresh()
 refreshAuto()
 enableView()
 
-print("WK 已就绪 (视野 + 自动转弯 V5 · 直接驱动屏幕摇杆 · 零联网 · 低开销) [WK_VIEW_V5]")
+print("WK 已就绪 (视野 + 自动转弯 V6 · 直写 SteerFloat · 屏幕诊断 · 零联网) [WK_VIEW_V6]")
