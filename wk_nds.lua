@@ -1,14 +1,16 @@
--- ===== WK 视野 + 自动转弯 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
+-- ===== WK 视野 + 自动转弯 V4 (去雾白昼 · 弯道大幅转向/漂移 · 零联网秒启动) =====
 -- 适用: 「不要停止 / make sure to drive fast」等雨夜浓雾黑夜驾驶地图
--- V3 新增「自动转弯」: 独立按钮, 遇弯道自己转向 + 漂移; 与视野开关互不隶属
---   探测: 以车辆【实际速度方向】为基准, 向前方 5 个角度 x 2 个距离向下打射线找路面,
---         路面延伸最远的方向 = 弯道方向 → 自动打方向 (不依赖任何地图/怪物名字)
---   控制: 自适应 —— 优先写 VehicleSeat.Steer; 若车辆是自定义脚本车, 改为直接给车身横摆扭矩
---   漂移: 速度高 + 转向大时, 叠加横向滑移 + 横摆角速度, 做出甩尾观感
+-- V4 专治「转弯幅度太小会撞墙」:
+--   1) 宽扇区 9 角度(±75°) + 3 档前探(最远 48 stud) → 更早、更广地发现急弯/直角弯
+--   2) 转向增益调猛: 偏离 20° 即打满舵 (旧版 50° 才满舵, 中等弯只给半舵)
+--   3) 平滑/探测频率提高 (0.8 / 0.08s) → 方向果断到位, 不再拖到贴墙才转
+--   4) 前方近处无路面(墙/断路)时【绝不回正】, 强制朝有路一侧满舵避险
+--   控制: 自适应 —— 优先写 VehicleSeat.Steer; 自定义脚本车改为车身横摆扭矩兜底
+--   漂移: 速度高 + 转向大时叠加横向滑移 + 横摆角速度, 做出甩尾观感
 --   性能: 未开启时【零新增开销】; 开启后不用每帧循环 —— 转向值靠属性变更信号维持,
---         路面探测每 0.15 秒一次 (10 条射线), 无全图遍历 / 无 GetDescendants
--- V2 视野逻辑原样保留: 删高频 DescendantAdded 监听 + 字典查重 + 反制节流 + 10 秒低频巡检
---   [WK_VIEW_V3]
+--         路面探测每 0.08 秒一次 (27 条射线), 无全图遍历 / 无 GetDescendants
+-- 视野逻辑原样保留: 删高频 DescendantAdded 监听 + 字典查重 + 反制节流 + 10 秒低频巡检
+--   [WK_VIEW_V4]
 
 local Lighting  = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
@@ -50,16 +52,17 @@ local FIX_THROTTLE   = 0.15  -- 秒; 属性写回最小间隔, 防乒乓
 local STASH_MAX      = 200
 
 -- ==========================================
--- 配置: 自动转弯 / 漂移
+-- 配置: 自动转弯 / 漂移  (V4: 大幅转向 + 提前预判 + 前方避险)
 -- ==========================================
-local AUTO_TICK      = 0.15  -- 秒; 路面探测间隔 (低频)
-local PROBE_ANGLES   = {-50, -25, 0, 25, 50}   -- 度; 扇形探测角度 (负=左)
-local PROBE_DISTS    = {14, 28}                 -- stud; 前探距离
-local PROBE_UP       = 4                        -- 射线起点抬高
-local PROBE_DOWN     = 35                       -- 向下探测深度
-local MAX_ANGLE      = 50                       -- 角度 → Steer 的归一化基准
+local AUTO_TICK      = 0.08  -- 秒; 路面探测间隔 (提高响应, 仍非每帧)
+local PROBE_ANGLES   = {-75, -50, -28, -12, 0, 12, 28, 50, 75}  -- 度; 宽扇区, 覆盖急弯/直角弯
+local PROBE_DISTS    = {10, 26, 48}         -- stud; 近处感知障碍 + 远处提前预判弯道
+local PROBE_W        = {1, 3, 5}            -- 三档得分权重 (越远仍有路越说明路往这边延伸)
+local PROBE_UP       = 4                     -- 射线起点抬高
+local PROBE_DOWN     = 35                    -- 向下探测深度
+local TURN_GAIN_DEG  = 20    -- 度; 偏离 20° 即打满舵 (越小越猛; 还嫌不够改 15)
 local STEER_SIGN     = 1     -- 若发现车往反方向拐, 把这里改成 -1
-local STEER_SMOOTH   = 0.35  -- 转向平滑系数, 防抖动
+local STEER_SMOOTH   = 0.8   -- 转向平滑 (提高: 果断到位, 不再拖到撞墙)
 local DRIFT_MIN_SPD  = 35    -- 触发漂移的最低速度
 local DRIFT_MIN_TURN = 0.45  -- 触发漂移的最小转向幅度
 local DRIFT_SIDE     = 10    -- 漂移横向滑移强度
@@ -267,22 +270,26 @@ local function forwardOf(root)
     return h.Unit
 end
 
--- 扇形探路面: 返回 (最佳角度, 得分)
+-- 扇形探路面: 返回 (最佳角度, 得分, 正前方近处是否被挡)
 local function probeRoad(root, fw)
     ensureParams()
     local origin = root.Position + Vector3.new(0, PROBE_UP, 0)
     local bestDeg, bestScore = 0, -1
+    local frontNearOK = false
     for _, deg in ipairs(PROBE_ANGLES) do
         local dir = rotated(fw, deg)
         local s = 0
         for i, d in ipairs(PROBE_DISTS) do
             local hit = Workspace:Raycast(origin + dir * d, Vector3.new(0, -PROBE_DOWN, 0), rayParams)
-            if hit then s = s + (i == 2 and 3 or 2) end   -- 远处仍有路面 = 路往这边延伸
+            if hit then
+                s = s + (PROBE_W[i] or 1)               -- 越远仍有路面 = 路往这边延伸
+                if deg == 0 and i <= 2 then frontNearOK = true end
+            end
         end
-        s = s + (1 - math.abs(deg) / 60) * 0.5           -- 轻微中心偏好, 避免直路上乱拐
+        s = s + (1 - math.abs(deg) / 90) * 0.4           -- 轻微中心偏好, 直路不乱拐
         if s > bestScore then bestScore, bestDeg = s, deg end
     end
-    return bestDeg, bestScore
+    return bestDeg, bestScore, not frontNearOK
 end
 
 -- 自适应控制方式: 能写 VehicleSeat.Steer 就用它, 否则扭矩兜底
@@ -345,18 +352,27 @@ local function autoTick()
     veh = v
     bindSeat(v.seat)
     local fw = forwardOf(v.root)
-    local deg, score = probeRoad(v.root, fw)
-    local target = 0
-    if score > 1 then
-        target = math.max(-1, math.min(1, -deg / MAX_ANGLE)) * STEER_SIGN
+    local deg, score, blocked = probeRoad(v.root, fw)
+    local raw = 0
+    if blocked then
+        -- 正前方紧挨着就没路面 (墙/断路): 绝不回正直怼, 朝有路一侧满舵避险
+        if deg ~= 0 then
+            raw = math.max(-1, math.min(1, -deg / TURN_GAIN_DEG))
+        else
+            raw = (math.abs(curSteer) > 0.05 and (curSteer > 0 and 1 or -1)) or 1
+        end
+        if math.abs(raw) < 0.85 then raw = raw >= 0 and 0.85 or -0.85 end
+    elseif score > 1 then
+        raw = math.max(-1, math.min(1, -deg / TURN_GAIN_DEG))
     end
+    local target = raw * STEER_SIGN
     curSteer = curSteer + (target - curSteer) * STEER_SMOOTH
     applySteer(curSteer)
     doDrift(v.root, fw, curSteer)
     local turning = math.abs(target) > 0.2
     if turning ~= wasTurning then
         wasTurning = turning
-        print("[WK] " .. (turning and "进入弯道 → 自动转向" or "回到直路 → 回正"))
+        print("[WK] " .. (blocked and "前方无路 → 满舵避险" or (turning and "进入弯道 → 自动转向" or "回到直路 → 回正")))
     end
 end
 
@@ -413,4 +429,4 @@ refresh()
 refreshAuto()
 enableView()
 
-print("WK 已就绪 (视野 + 自动转弯/漂移 · 零联网 · 低开销) [WK_VIEW_V3]")
+print("WK 已就绪 (视野 + 自动转弯/漂移 V4 · 大幅转向防撞墙 · 零联网 · 低开销) [WK_VIEW_V4]")
