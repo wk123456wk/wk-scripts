@@ -1,15 +1,20 @@
--- ===== WK 视野 + 自动转弯 V6 (去雾白昼 · 直写 VehicleSeat 摇杆输出 · 零联网秒启动) =====
+-- ===== WK 视野 + 自动转弯 V7 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
 -- 适用: 「不要停止 / make sure to drive fast」等雨夜浓雾黑夜驾驶地图
--- V6 修正依据 (Roblox 官方 VehicleSeat 文档):
---   * Steer 是 int(1/0/-1) 且已弃用; 移动端摇杆的模拟转向写入的是 SteerFloat (float, 1右~-1左)
---   * 二者 ReadWrite / security None, 且 "Will refresh back to 0 unless constantly set"
---   * VirtualInputManager 是内部服务(RobloxScriptSecurity), 普通脚本无法注入触摸 → 放弃 V5 方案
---   实现: 找到 VehicleSeat → 写 SteerFloat + Steer → Heartbeat 每帧持续写 + 属性变更即时写回
---   兜底: 非 VehicleSeat 的车, 写车模型内可疑转向 Value/HingeConstraint + 车身横摆扭矩
---   诊断: 开启后屏幕左上角显示 座位类型 / 目标舵 / SteerFloat 读回值 / 候选对象名 (截图即可)
---   性能: 未开启时零新增开销; 开启后每帧仅几次属性赋值, 无全图遍历, 无每帧射线
+-- V7 是依据 V6【屏幕诊断的实测证据】重做, 不再凭猜测换控制通道:
+--   诊断实录: 「座位 普通Seat | 无Float 每帧 / 目标 +0.00 读回 -」
+--   [证据1] 这游戏不是 VehicleSeat, 连 SteerFloat 属性都不存在 → V6 写了个不存在的属性, 全废
+--   [证据2] 目标恒 +0.00 → 旧版「向下打射线找路面」在整片大地地图上 9 个方向全部命中,
+--           得分几乎相同 + 中心偏好 → 永远判直路, 一次方向都没打过。这是更致命的独立 Bug
+-- V7 两项根本修复:
+--   (1) 探路改为【水平前方障碍射线】: 从车头向 9 个方向打水平射线, 测「撞墙距离」(法线朝上
+--       的地面不算障碍), 叠加远处地面连续性; 选最空的方向。前方近处有墙 → 立即满舵避险
+--   (2) 转向输出改为【自适应取证 + 多通道并打】: 开启时扫描 PlayerGui/CoreGui 定位真实摇杆,
+--       列出 ReplicatedStorage/车模型 的 RemoteEvent 与转向 Value; 驱动时按 触摸注入 /
+--       firesignal / knob 位置 / 转向 Value / SteerFloat / 车身横摆 依次尝试, 每条通道的
+--       成功与失败都显示在屏幕诊断里, 点「复制诊断」即可把完整对象清单粘贴出来
 -- 视野逻辑原样保留: 删高频 DescendantAdded 监听 + 字典查重 + 反制节流 + 10 秒低频巡检
---   [WK_VIEW_V6]
+--   性能: 未开启零新增开销; 扫描只在开启/换车时做一次; 每帧仅几次属性赋值
+--   [WK_VIEW_V7]
 
 local Lighting  = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
@@ -51,31 +56,39 @@ local FIX_THROTTLE   = 0.15  -- 秒; 属性写回最小间隔, 防乒乓
 local STASH_MAX      = 200
 
 -- ==========================================
--- 配置: 自动转弯 / 漂移  (V4 弯道决策原样保留)
+-- 配置: 自动转弯 / 漂移  (V7 水平障碍探路)
 -- ==========================================
-local AUTO_TICK      = 0.08  -- 秒; 路面探测间隔 (提高响应, 仍非每帧)
-local PROBE_ANGLES   = {-75, -50, -28, -12, 0, 12, 28, 50, 75}  -- 度; 宽扇区, 覆盖急弯/直角弯
-local PROBE_DISTS    = {10, 26, 48}         -- stud; 近处感知障碍 + 远处提前预判弯道
-local PROBE_W        = {1, 3, 5}            -- 三档得分权重 (越远仍有路越说明路往这边延伸)
-local PROBE_UP       = 4                     -- 射线起点抬高
-local PROBE_DOWN     = 35                    -- 向下探测深度
-local TURN_GAIN_DEG  = 20    -- 度; 偏离 20° 即打满舵 (越小越猛; 还嫌不够改 15)
-local STEER_SIGN     = 1     -- 若发现车往反方向拐, 把这里改成 -1
-local STEER_SMOOTH   = 0.8   -- 转向平滑 (提高: 果断到位, 不再拖到撞墙)
-local DRIFT_MIN_SPD  = 35    -- 触发漂移的最低速度
-local DRIFT_MIN_TURN = 0.45  -- 触发漂移的最小转向幅度
-local DRIFT_SIDE     = 10    -- 漂移横向滑移强度
-local DRIFT_YAW      = 0.8   -- 漂移附加横摆
-local TORQUE_YAW     = 1.6   -- 扭矩兜底模式的横摆角速度
+local AUTO_TICK      = 0.08  -- 秒; 探路间隔
+local PROBE_ANGLES   = {-75, -50, -28, -12, 0, 12, 28, 50, 75}  -- 度; 正=左, 负=右
+local PROBE_LEN      = 55    -- stud; 水平前探距离
+local PROBE_UP       = 2     -- 射线起点抬高 (避开地面)
+local WALL_DANGER    = 18    -- stud; 正前方障碍近于此 → 紧急满舵避险
+local TURN_GAIN_DEG  = 22    -- 度; 最佳方向偏离 22° 即打满舵 (越小越猛)
+local STEER_SIGN     = 1     -- 车往反方向拐 → 改成 -1
+local STICK_SIGN     = 1     -- 摇杆左右拖反 → 改成 -1
+local STEER_SMOOTH   = 0.8
+local DRIFT_MIN_SPD  = 35
+local DRIFT_MIN_TURN = 0.45
+local DRIFT_SIDE     = 10
+local DRIFT_YAW      = 0.8
+local TORQUE_YAW     = 1.6
 
 -- ==========================================
--- 配置: 转向输出 (V6 主通道, 依据 Roblox 官方 VehicleSeat 文档)
+-- 配置: 转向输出 (V7 自适应取证 + 多通道)
 -- ==========================================
-local WRITE_FLOAT    = true   -- 写 SteerFloat (移动端摇杆的模拟转向值, float 1~-1)
-local WRITE_INT      = true   -- 同时写 Steer (int 1/0/-1, 兼容老式脚本)
-local EVERY_FRAME    = true   -- 每帧持续写 (官方: 不持续设置会刷回 0)
-local HINGE_ANGLE    = 30    -- 自定义车伺服转向铰链的满舵角度
-local DIAG           = true   -- 屏幕诊断 (确认工作后可改 false 隐藏)
+local STICK_NAME     = ""    -- 留空=自动扫描; 诊断里看到正确对象名后填这里精确锁定
+local STICK_RADIUS   = 0     -- 0=按摇杆尺寸自动算; 也可填固定像素如 70
+local TRY_TOUCH      = true  -- VirtualInputManager 触摸注入 (带成功/失败回显)
+local TRY_FIRESIGNAL = true  -- firesignal 触发摇杆输入信号 (若执行器提供)
+local TRY_KNOB       = true  -- 直接移动 knob 位置 (降级)
+local TRY_VALUES     = true  -- 写名字含 steer/turn/方向 的 Value
+local TRY_SEAT       = true  -- 写 SteerFloat / Steer (若座位支持)
+local TRY_TORQUE     = true  -- 车身横摆兜底
+local WRITE_FLOAT    = true
+local WRITE_INT      = true
+local EVERY_FRAME    = true
+local HINGE_ANGLE    = 30
+local DIAG           = true  -- 屏幕诊断 (确认工作后可改 false 隐藏)
 
 -- ==========================================
 -- 状态
@@ -96,6 +109,15 @@ local floatOK, intOK = false, false
 local carValues, carNames = {}, {}
 local wasTurning = false
 local diagT = 0
+-- V7 取证 / 通道状态
+local stick, stickCenter, stickRadius, knobBase = nil, nil, nil, nil
+local stickCands, remoteObjs, remoteNames, stickVals, valueNames = {}, {}, {}, {}, {}
+local chanTouch, chanFire, chanKnob, chanVal, chanSeat = "未测", "-", "-", "-", "-"
+local touchOK, touchSig, touchErr = false, 0, ""
+local touchDown, touchId = false, 9137
+local probeInfo = "探路 -"
+local fullReport = ""
+local updateDiag
 
 local function setP(obj, prop, val) pcall(function() obj[prop] = val end) end
 local function getP(obj, prop)
@@ -136,16 +158,16 @@ end
 local btn     = mkBtn(0,  "WK 视野：关")
 local btnAuto = mkBtn(54, "自动转弯：关")
 
--- 屏幕诊断: 仅自动转弯开启时可见; 手机端不用开控制台, 直接截图即可
+-- 屏幕诊断 (V7): 仅自动转弯开启时可见; 加大显示多通道状态
 local diag = Instance.new("TextLabel")
 diag.Name = "WK_Diag"
-diag.Size = UDim2.new(0, 236, 0, 78)
+diag.Size = UDim2.new(0, 272, 0, 170)
 diag.Position = UDim2.new(0, 12, 0.30, 106)
 diag.BackgroundColor3 = Color3.fromRGB(12, 16, 20)
-diag.BackgroundTransparency = 0.35
+diag.BackgroundTransparency = 0.28
 diag.BorderSizePixel = 0
 diag.Font = Enum.Font.Gotham
-diag.TextSize = 11
+diag.TextSize = 10
 diag.TextColor3 = Color3.fromRGB(170, 235, 185)
 diag.TextXAlignment = Enum.TextXAlignment.Left
 diag.TextYAlignment = Enum.TextYAlignment.Top
@@ -154,6 +176,35 @@ diag.Text = "诊断待开启"
 diag.Visible = false
 diag.Parent = gui
 pcall(function() Instance.new("UICorner", diag).CornerRadius = UDim.new(0, 8) end)
+
+-- 一键复制完整取证报告 (手机端不用开控制台 / 不用截图)
+local copyBtn = Instance.new("TextButton")
+copyBtn.Name = "WK_Copy"
+copyBtn.Size = UDim2.new(0, 92, 0, 26)
+copyBtn.Position = UDim2.new(0, 12, 0.30, 278)
+copyBtn.BackgroundColor3 = DARK
+copyBtn.BorderSizePixel = 0
+copyBtn.Font = Enum.Font.GothamBold
+copyBtn.Text = "复制诊断"
+copyBtn.TextColor3 = Color3.fromRGB(230, 230, 230)
+copyBtn.TextSize = 11
+copyBtn.Visible = false
+copyBtn.Parent = gui
+pcall(function() Instance.new("UICorner", copyBtn).CornerRadius = UDim.new(0, 13) end)
+
+copyBtn.Activated:Connect(function()
+    local done = false
+    pcall(function()
+        local env = (type(getgenv) == "function") and getgenv() or _G
+        for _, n in ipairs({"setclipboard", "toclipboard", "set_clipboard", "setclip"}) do
+            if type(env[n]) == "function" then
+                if pcall(env[n], fullReport) then done = true break end
+            end
+        end
+    end)
+    copyBtn.Text = done and "已复制" or "无剪贴板"
+    task.delay(1.6, function() pcall(function() copyBtn.Text = "复制诊断" end) end)
+end)
 
 local function refresh()
     if ON then
@@ -256,11 +307,26 @@ local function disableView()
 end
 
 -- ==========================================
--- 能力B: 自动转弯 + 漂移  (V6: 直写 VehicleSeat 摇杆输出属性)
+-- 能力B: 自动转弯 V7 (水平障碍探路 + 自适应取证 + 多通道驱动)
 -- ==========================================
 local RunService = game:GetService("RunService")
+local VIM = nil
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+local RS = game:GetService("ReplicatedStorage")
 
--- 找座位: 优先真正的 VehicleSeat (摇杆输出写在这里), 否则退回 SeatPart
+local VALUE_KEY = {
+    steer=1, turn=1, input=1, direction=1, dir=1, angle=1, wheel=1, yaw=1,
+    drive=1, control=1, vehicle=1, car=1, move=1, throttle=1,
+    ["转向"]=1, ["方向"]=1, ["角度"]=1, ["驾驶"]=1, ["移动"]=1, ["油门"]=1,
+}
+local function nameHit(n)
+    if not n then return false end
+    n = tostring(n):lower()
+    for k in pairs(VALUE_KEY) do if n:find(k, 1, true) then return true end end
+    return false
+end
+
+-- 座位 / 车身 (V6 基础上补 PrimaryPart 作为探路与扭矩目标)
 local function findVehicle()
     local char = p.Character
     if not char then return nil end
@@ -273,18 +339,12 @@ local function findVehicle()
     if not vs and model then
         pcall(function() vs = model:FindFirstChildWhichIsA("VehicleSeat", true) end)
     end
-    if not vs then
-        pcall(function()
-            local par = seat.Parent
-            if par then vs = par:FindFirstChildWhichIsA("VehicleSeat", true) end
-        end)
-    end
+    local body = model and model.PrimaryPart or nil
     local target = vs or seat
     return { seat = target, rawSeat = seat, isVehicleSeat = vs ~= nil,
-             model = model, root = target, char = char }
+             model = model, root = body or target, body = body, char = char }
 end
 
--- 射线过滤: 排除自己的角色 / 车, 否则会打到自己的车顶
 local function ensureParams()
     if rayParams and veh and lastChar == veh.char and lastModel == veh.model then return end
     lastChar, lastModel = veh and veh.char, veh and veh.model
@@ -299,106 +359,270 @@ local function ensureParams()
     rayParams.FilterDescendantsInstances = f
 end
 
--- 绕 Y 轴旋转水平向量 (正角度 = 左)
-local function rotated(v, deg)
-    local c, s = math.cos(math.rad(deg)), math.sin(math.rad(deg))
-    return Vector3.new(v.X * c + v.Z * s, 0, -v.X * s + v.Z * c)
-end
--- 前进方向: 优先用实际速度方向 (车真实往哪开), 低速时用座椅朝向
-local function forwardOf(root)
-    local ok, vel = pcall(function() return root.AssemblyLinearVelocity end)
-    if ok and vel then
-        local h = Vector3.new(vel.X, 0, vel.Z)
-        if h.Magnitude > 5 then return h.Unit end
+-- 前进方向: 优先实际速度方向 (车身/座位都试), 低速时退回朝向
+local function forwardOf(root, alt)
+    for _, r in ipairs({root, alt}) do
+        if r then
+            local ok, vel = pcall(function() return r.AssemblyLinearVelocity end)
+            if ok and vel then
+                local h = Vector3.new(vel.X, 0, vel.Z)
+                if h.Magnitude > 5 then return h.Unit end
+            end
+        end
     end
-    local lv = root.CFrame.LookVector
+    local r = root or alt
+    local lv = r.CFrame.LookVector
     local h = Vector3.new(lv.X, 0, lv.Z)
     if h.Magnitude < 0.01 then return Vector3.new(0, 0, -1) end
     return h.Unit
 end
 
--- 扇形探路面: 返回 (最佳角度, 得分, 正前方近处是否被挡)
-local function probeRoad(root, fw)
+-- [TEST_BLOCK_START]
+-- 绕 Y 轴旋转水平向量 (正角度 = 左)
+local function rotated(v, deg)
+    local c, s = math.cos(math.rad(deg)), math.sin(math.rad(deg))
+    return Vector3.new(v.X * c + v.Z * s, 0, -v.X * s + v.Z * c)
+end
+
+-- V7 探路: 水平障碍射线 (测撞墙距离) + 远处地面连续性 (测路面边界)
+--   旧版只「向下找路面」, 在整片大地地图上 9 个方向全命中 → 恒判直路 (诊断 目标 +0.00)
+local function probeAhead(root, fw)
     ensureParams()
     local origin = root.Position + Vector3.new(0, PROBE_UP, 0)
     local bestDeg, bestScore = 0, -1
-    local frontNearOK = false
+    local frontDist = PROBE_LEN
     for _, deg in ipairs(PROBE_ANGLES) do
         local dir = rotated(fw, deg)
-        local s = 0
-        for i, d in ipairs(PROBE_DISTS) do
-            local hit = Workspace:Raycast(origin + dir * d, Vector3.new(0, -PROBE_DOWN, 0), rayParams)
-            if hit then
-                s = s + (PROBE_W[i] or 1)               -- 越远仍有路面 = 路往这边延伸
-                if deg == 0 and i <= 2 then frontNearOK = true end
-            end
+        local d = PROBE_LEN
+        local ok, hit = pcall(function()
+            return Workspace:Raycast(origin, dir * PROBE_LEN, rayParams)
+        end)
+        -- 打到地面(法线朝上)不算障碍; 墙/栏杆/树/建筑才算
+        if ok and hit and not (hit.Normal and hit.Normal.Y > 0.6) then
+            d = hit.Distance
         end
-        s = s + (1 - math.abs(deg) / 90) * 0.4           -- 轻微中心偏好, 直路不乱拐
-        if s > bestScore then bestScore, bestDeg = s, deg end
+        if deg == 0 then frontDist = d end
+        local ground = 0
+        for _, dd in ipairs({20, 42}) do
+            local ok2, g = pcall(function()
+                return Workspace:Raycast(origin + dir * dd + Vector3.new(0, 6, 0),
+                                         Vector3.new(0, -40, 0), rayParams)
+            end)
+            if ok2 and g then ground = ground + (dd == 42 and 2 or 1) end
+        end
+        local score = (d / PROBE_LEN) * 10 + ground * 1.2 + (1 - math.abs(deg) / 90) * 1.0
+        if score > bestScore then bestScore, bestDeg = score, deg end
     end
-    return bestDeg, bestScore, not frontNearOK
+    return bestDeg, frontDist, bestScore
 end
+-- [TEST_BLOCK_END]
 
--- === V6 转向输出 ===
-local VALUE_KEY = {
-    steer=1, turn=1, input=1, direction=1, dir=1, angle=1, wheel=1, yaw=1,
-    ["转向"]=1, ["方向"]=1, ["角度"]=1,
-}
-
--- 扫描车模型内可疑的转向值对象 (仅换车时一次; 只收看起来像输入量的)
-local function scanCarValues(model)
-    carValues, carNames = {}, {}
-    if not model then return end
-    pcall(function()
-        for _, o in ipairs(model:GetDescendants()) do
-            local isHinge = (o.ClassName == "HingeConstraint")
-            local isVal   = o:IsA("NumberValue") or o:IsA("IntValue")
-            if isHinge or isVal then
-                local n = o.Name:lower()
-                local match = false
-                for k in pairs(VALUE_KEY) do if n:find(k, 1, true) then match = true break end end
-                if match and (isHinge or (type(o.Value) == "number" and math.abs(o.Value) <= 1.01)) then
-                    table.insert(carValues, o)
-                    table.insert(carNames, o.Name)
+-- ===== 取证: 定位真实摇杆 / RemoteEvent / 转向 Value =====
+-- [TEST_STICK_START]
+local function findStick(vpX, vpY)
+    stick, stickCenter, stickRadius, knobBase = nil, nil, nil, nil
+    stickCands = {}
+    local best, bestScore = nil, -1
+    for _, parent in ipairs({PlayerGui, CoreGui}) do
+        pcall(function()
+            for _, o in ipairs(parent:GetDescendants()) do
+                if o:IsA("GuiObject") and not o:IsDescendantOf(gui) then
+                    local pos, sz = o.AbsolutePosition, o.AbsoluteSize
+                    local n = o.Name:lower()
+                    local sc = 0
+                    if pos.Y > vpY * 0.45 and pos.X < vpX * 0.55 then sc = sc + 6 end
+                    if n:find("stick") or n:find("joystick") or n:find("thumb")
+                       or n:find("wheel") or n:find("drag") or n:find("steer")
+                       or n:find("摇杆") or n:find("方向") then sc = sc + 9 end
+                    if sz.X >= 40 and sz.Y >= 40 and sz.X <= 280 and sz.Y <= 280 then
+                        local r = sz.X / math.max(sz.Y, 1)
+                        if r > 0.65 and r < 1.5 then sc = sc + 5 end
+                    end
+                    if o:IsA("ImageButton") or o:IsA("ImageLabel") then sc = sc + 2 end
+                    if sc >= 6 then
+                        table.insert(stickCands, string.format("%s [%s] %.0f,%.0f %dx%d 分%d",
+                            o.Name, o.ClassName, pos.X, pos.Y, sz.X, sz.Y, sc))
+                        if sc > bestScore then bestScore, best = sc, o end
+                    end
                 end
             end
-            if #carValues >= 8 then break end
-        end
-    end)
+        end)
+    end
+    if STICK_NAME ~= "" then
+        pcall(function()
+            local o = PlayerGui:FindFirstChild(STICK_NAME, true)
+            if not o then o = CoreGui:FindFirstChild(STICK_NAME, true) end
+            if o and o:IsA("GuiObject") then best = o end
+        end)
+    end
+    if best then
+        stick = best
+        local pos, sz = best.AbsolutePosition, best.AbsoluteSize
+        stickCenter = Vector2.new(pos.X + sz.X / 2, pos.Y + sz.Y / 2)
+        stickRadius = (STICK_RADIUS > 0) and STICK_RADIUS
+            or (math.min(sz.X, sz.Y) * 0.38)
+        knobBase = best.Position
+    end
+    return best
+end
+-- [TEST_STICK_END]
+
+local function findObjects()
+    remoteObjs, remoteNames, stickVals, valueNames = {}, {}, {}, {}
+    local seen, cnt = {}, 0
+    local function walk(root, depth)
+        if not root or depth > 4 or cnt > 400 then return end
+        pcall(function()
+            for _, o in ipairs(root:GetChildren()) do
+                cnt = cnt + 1
+                if cnt > 400 then break end
+                if (o:IsA("RemoteEvent") or o:IsA("UnreliableRemoteEvent")) and not seen[o] then
+                    seen[o] = true
+                    table.insert(remoteObjs, o)
+                    table.insert(remoteNames, o.Name)
+                end
+                if depth < 4 then walk(o, depth + 1) end
+            end
+        end)
+    end
+    walk(RS, 0)
+    if veh and veh.model then walk(veh.model, 0) end
+    local function vals(root)
+        if not root then return end
+        pcall(function()
+            for _, o in ipairs(root:GetDescendants()) do
+                if (o:IsA("NumberValue") or o:IsA("IntValue")) and nameHit(o.Name) then
+                    table.insert(stickVals, o)
+                    table.insert(valueNames, o.Name .. "=" .. tostring(o.Value))
+                end
+                if #stickVals >= 12 then break end
+            end
+        end)
+    end
+    vals(veh and veh.model)
+    vals(PlayerGui)
 end
 
--- 真正的输出: 写 SteerFloat (模拟) + Steer (整数) + 自定义车兜底
+-- ===== 多通道 =====
+-- 触摸注入能力探测: 实测两种签名, 结果写进诊断 (不再靠文档猜)
+local function detectTouch()
+    touchOK, touchSig, touchErr = false, 0, ""
+    if not TRY_TOUCH or not VIM then touchErr = "无VirtualInputManager"; return end
+    local a = pcall(function()
+        VIM:SendTouchEvent(touchId, Enum.UserInputState.End, Vector2.new(5, 5))
+    end)
+    local b = pcall(function() VIM:SendTouchEvent(5, 5, false) end)
+    if a then
+        touchOK, touchSig, chanTouch = true, 1, "可用 新签名"
+    elseif b then
+        touchOK, touchSig, chanTouch = true, 2, "可用 老签名"
+    else
+        local _, err = pcall(function()
+            VIM:SendTouchEvent(touchId, Enum.UserInputState.End, Vector2.new(5, 5))
+        end)
+        touchErr = tostring(err):sub(1, 60)
+        chanTouch = "被拒绝"
+    end
+end
+
+local function applyTouch(v)
+    if not (touchOK and stickCenter) then return end
+    local x = stickCenter.X + v * stickRadius * STICK_SIGN
+    local y = stickCenter.Y
+    if touchSig == 1 then
+        if not touchDown then
+            pcall(function() VIM:SendTouchEvent(touchId, Enum.UserInputState.Begin,
+                                                Vector2.new(stickCenter.X, y)) end)
+            touchDown = true
+        end
+        pcall(function() VIM:SendTouchEvent(touchId, Enum.UserInputState.Change,
+                                            Vector2.new(x, y)) end)
+    else
+        pcall(function() VIM:SendTouchEvent(x, y, true) end)
+        pcall(function() VIM:SendTouchEvent(x, y, false) end)
+    end
+end
+local function releaseTouch()
+    if touchDown and touchOK and touchSig == 1 and stickCenter then
+        pcall(function() VIM:SendTouchEvent(touchId, Enum.UserInputState.End,
+                                            Vector2.new(stickCenter.X, stickCenter.Y)) end)
+    end
+    touchDown = false
+end
+
+local function getFireSignal()
+    if type(firesignal) == "function" then return firesignal end
+    local f
+    pcall(function()
+        if type(getgenv) == "function" then f = getgenv().firesignal end
+    end)
+    return f
+end
+local function applyFireSignal(v)
+    if not TRY_FIRESIGNAL or not stick or not stickCenter then return end
+    local fs = getFireSignal()
+    if type(fs) ~= "function" then chanFire = "无此API"; return end
+    local fake = {
+        Position = Vector3.new(stickCenter.X + v * stickRadius * STICK_SIGN, stickCenter.Y, 0),
+        Delta    = Vector3.new(v * 3, 0, 0),
+        UserInputType  = Enum.UserInputType.Touch,
+        UserInputState = Enum.UserInputState.Change,
+    }
+    local ok, err = pcall(function() fs(stick.InputChanged, fake) end)
+    chanFire = ok and "OK" or ("错误:" .. tostring(err):sub(1, 22))
+end
+
+local function applyKnob(v)
+    if not TRY_KNOB or not stick or not knobBase then return end
+    local ok = pcall(function()
+        stick.Position = UDim2.new(knobBase.X.Scale,
+            knobBase.X.Offset + v * stickRadius * STICK_SIGN,
+            knobBase.Y.Scale, knobBase.Y.Offset)
+    end)
+    chanKnob = ok and "OK" or "失败"
+end
+local function restoreKnob()
+    if stick and knobBase then pcall(function() stick.Position = knobBase end) end
+end
+
+local function applyValues(v)
+    if not TRY_VALUES then return end
+    local n = 0
+    for _, o in ipairs(stickVals) do
+        if pcall(function() o.Value = v end) then n = n + 1 end
+    end
+    chanVal = (#stickVals == 0) and "无对象" or (n .. "/" .. #stickVals .. " 写入")
+end
+
 local function writeSeat(v)
     if not veh or not veh.seat then return end
     local s = veh.seat
-    if WRITE_FLOAT then pcall(function() s.SteerFloat = v end) end
-    if WRITE_INT   then pcall(function() s.Steer = (v > 0.15 and 1 or (v < -0.15 and -1 or 0)) end) end
-    if not veh.isVehicleSeat then
-        for _, o in ipairs(carValues) do
-            pcall(function()
-                if o:IsA("NumberValue") or o:IsA("IntValue") then
-                    o.Value = v
-                elseif o.ClassName == "HingeConstraint" then
-                    o.TargetAngle = v * HINGE_ANGLE
-                end
-            end)
-        end
+    if TRY_SEAT and WRITE_FLOAT then pcall(function() s.SteerFloat = v end) end
+    if TRY_SEAT and WRITE_INT then
+        pcall(function() s.Steer = (v > 0.15 and 1 or (v < -0.15 and -1 or 0)) end)
+    end
+    for _, o in ipairs(carValues) do
         pcall(function()
-            local av = veh.root.AssemblyAngularVelocity
-            veh.root.AssemblyAngularVelocity = Vector3.new(av.X, v * TORQUE_YAW, av.Z)
+            if o.ClassName == "HingeConstraint" then o.TargetAngle = v * HINGE_ANGLE end
+        end)
+    end
+    if TRY_TORQUE then
+        pcall(function()
+            local r = veh.body or veh.root
+            local av = r.AssemblyAngularVelocity
+            r.AssemblyAngularVelocity = Vector3.new(av.X, v * TORQUE_YAW, av.Z)
         end)
     end
 end
 
--- 绑定座位: 探测可写属性 + 属性变更即时写回 + 扫描候选 (换车才重做)
 local function bindVehicle(v)
     if lastSeat == v.seat then return end
     lastSeat = v.seat
     if floatConn then pcall(function() floatConn:Disconnect() end); floatConn = nil end
     floatOK = pcall(function() local _ = v.seat.SteerFloat; v.seat.SteerFloat = 0 end)
     intOK   = pcall(function() local _ = v.seat.Steer; v.seat.Steer = 0 end)
+    chanSeat = (floatOK and "Float可写") or (intOK and "Int可写") or "普通Seat/无属性"
     if floatOK then
-        -- 引擎每帧把 SteerFloat 清成 0 时立刻压回, 不靠轮询
         pcall(function()
             floatConn = v.seat:GetPropertyChangedSignal("SteerFloat"):Connect(function()
                 if not AUTO_ON then return end
@@ -409,10 +633,15 @@ local function bindVehicle(v)
             end)
         end)
     end
-    scanCarValues(v.model)
+    -- 一次性取证 (只在开启 / 换车时做)
+    local cam = Workspace.CurrentCamera
+    local vp = (cam and cam.ViewportSize) or Vector2.new(1280, 720)
+    findStick(vp.X, vp.Y)
+    findObjects()
+    detectTouch()
+    updateDiag(true)
 end
 
--- 每帧持续写 (官方要求 constantly set; 回调只有几次属性赋值, 不遍历不射线)
 local function startFrameWriter()
     if not EVERY_FRAME or frameConn then return end
     frameConn = RunService.Heartbeat:Connect(function()
@@ -421,30 +650,59 @@ local function startFrameWriter()
     end)
 end
 
--- 屏幕诊断: 读回 SteerFloat 与目标的差, 一眼看出写入是否被接受
-local function updateDiag(force)
+updateDiag = function(force)
     if not DIAG then return end
     local now = os.clock()
     if not force and now - diagT < 0.3 then return end
     diagT = now
-    local seatType, readback = "未坐车", "-"
+    local seatType = veh and (veh.isVehicleSeat and "VehicleSeat"
+        or ("普通" .. (veh.rawSeat and veh.rawSeat.ClassName or "Seat"))) or "未坐车"
+    local readback = "-"
     if veh then
-        seatType = veh.isVehicleSeat and "VehicleSeat"
-            or ("普通" .. (veh.rawSeat and veh.rawSeat.ClassName or "Seat"))
         local ok, val = pcall(function() return veh.seat.SteerFloat end)
         if ok and type(val) == "number" then readback = string.format("%+.2f", val) end
     end
-    local ch = (floatOK and "Float" or "无Float") .. (intOK and "+Int" or "")
-        .. (EVERY_FRAME and " 每帧" or "")
-    local names = "无"
-    if #carNames > 0 then names = table.concat(carNames, ",", 1, math.min(3, #carNames)) end
-    diag.Text = string.format("座位 %s | %s\n目标 %+.2f  读回 %s\n候选 %s\n%s",
-        seatType, ch, curSteer, readback, names,
-        (veh and veh.isVehicleSeat) and "读回≈目标 → 写入成功"
-            or "非VehicleSeat/写入被覆盖 → 截图发我")
+    local stickTxt = "-"
+    if stick and stickCenter then
+        stickTxt = string.format("%s @%.0f,%.0f R%.0f",
+            stick.Name, stickCenter.X, stickCenter.Y, stickRadius)
+    end
+    diag.Text = string.format(
+        "座位 %s | %s\n探路 %s\n目标 %+.2f 读回 %s\n摇杆 %s\n触摸 %s | 信号 %s\n通道 knob %s / Val %s / 扭矩 %s\n候选摇杆 %d | Remote %d | Value %d\n点「复制诊断」粘贴完整清单",
+        seatType, chanSeat, probeInfo, curSteer, readback, stickTxt,
+        chanTouch, chanFire, chanKnob, chanVal, (TRY_TORQUE and "开" or "关"),
+        #stickCands, #remoteObjs, #stickVals)
+    local L = {}
+    local function add(x) L[#L + 1] = x end
+    add("=== WK V7 诊断报告 (整段粘贴给我) ===")
+    add("座位: " .. seatType .. " | 车模型: " .. ((veh and veh.model and veh.model.Name) or "无"))
+    add("车身部件: " .. ((veh and veh.body and veh.body.Name) or "无PrimaryPart"))
+    add("座位属性: " .. chanSeat .. " | 读回 " .. readback)
+    add("探路: " .. probeInfo .. " | 当前目标 " .. string.format("%+.2f", curSteer))
+    add("摇杆锁定: " .. stickTxt)
+    add("触摸注入: " .. chanTouch .. " " .. touchErr)
+    add("firesignal: " .. chanFire)
+    add("--- 摇杆候选 (" .. #stickCands .. ") ---")
+    for i, x in ipairs(stickCands) do if i <= 12 then add(x) end end
+    add("--- RemoteEvent (" .. #remoteNames .. ") ---")
+    for i, x in ipairs(remoteNames) do if i <= 50 then add(x) end end
+    add("--- 转向 Value (" .. #valueNames .. ") ---")
+    for i, x in ipairs(valueNames) do if i <= 12 then add(x) end end
+    add("--- ScreenGui ---")
+    pcall(function()
+        for _, parent in ipairs({PlayerGui, CoreGui}) do
+            for _, o in ipairs(parent:GetChildren()) do
+                if o:IsA("ScreenGui") and o ~= gui then
+                    add(o.Name .. " [" .. tostring(o.Parent and o.Parent.Name) .. "]")
+                end
+            end
+        end
+    end)
+    add("=== 把以上全部粘贴给我即可 ===")
+    fullReport = table.concat(L, "\n")
 end
 
--- 漂移: 高速急弯时叠加横向滑移 + 横摆 (best-effort, pcall 兜底不影响主转向)
+-- 漂移: 高速急弯叠加横向滑移 + 横摆 (best-effort)
 local function doDrift(root, fw, v)
     local ok, vel = pcall(function() return root.AssemblyLinearVelocity end)
     if not ok or not vel then return end
@@ -462,35 +720,43 @@ local function autoTick()
     if not AUTO_ON then return end
     local v = findVehicle()
     if not v then
-        curSteer = curSteer * 0.7   -- 没坐车/角色未就绪: 缓慢回正
+        curSteer = curSteer * 0.7
+        if math.abs(curSteer) < 0.02 then curSteer = 0 end
+        applyTouch(0)
         updateDiag()
         return
     end
     veh = v
     bindVehicle(v)
-    local fw = forwardOf(v.root)
-    local deg, score, blocked = probeRoad(v.root, fw)
+    local fw = forwardOf(v.root, v.seat)
+    local deg, frontDist, score = probeAhead(v.root, fw)
+    probeInfo = string.format("最佳%+d° 前方%.0fstud 分%.1f", deg, frontDist, score)
     local raw = 0
-    if blocked then
-        -- 正前方紧挨着就没路面 (墙/断路): 绝不回正直怼, 朝有路一侧满舵避险
+    if frontDist < WALL_DANGER then
+        -- 正前方近处有墙: 朝最空方向满舵避险 (绝不回正直怼)
         if deg ~= 0 then
             raw = math.max(-1, math.min(1, -deg / TURN_GAIN_DEG))
         else
             raw = (math.abs(curSteer) > 0.05 and (curSteer > 0 and 1 or -1)) or 1
         end
         if math.abs(raw) < 0.85 then raw = raw >= 0 and 0.85 or -0.85 end
-    elseif score > 1 then
+    elseif deg ~= 0 then
         raw = math.max(-1, math.min(1, -deg / TURN_GAIN_DEG))
     end
     local target = raw * STEER_SIGN
     curSteer = curSteer + (target - curSteer) * STEER_SMOOTH
     writeSeat(curSteer)
+    applyValues(curSteer)
+    applyTouch(curSteer)
+    applyFireSignal(curSteer)
+    applyKnob(curSteer)
     doDrift(v.root, fw, curSteer)
     updateDiag()
     local turning = math.abs(target) > 0.2
     if turning ~= wasTurning then
         wasTurning = turning
-        print("[WK] " .. (blocked and "前方无路 → 满舵避险" or (turning and "进入弯道 → 自动转向" or "回到直路 → 回正")))
+        print("[WK] " .. (frontDist < WALL_DANGER and "前方障碍 → 满舵避险"
+            or (turning and "弯道 → 自动转向" or "直路 → 回正")))
     end
 end
 
@@ -498,6 +764,7 @@ local function startAuto()
     if autoThread then return end
     autoAlive = true
     diag.Visible = DIAG
+    copyBtn.Visible = DIAG
     startFrameWriter()
     updateDiag(true)
     autoThread = task.spawn(function()
@@ -512,15 +779,18 @@ local function stopAuto()
     if frameConn then pcall(function() frameConn:Disconnect() end); frameConn = nil end
     if floatConn then pcall(function() floatConn:Disconnect() end); floatConn = nil end
     if autoThread then pcall(function() task.cancel(autoThread) end); autoThread = nil end
+    releaseTouch()
+    restoreKnob()
     lastSeat, rayParams, lastChar, lastModel = nil, nil, nil, nil
     wasTurning = false
     if veh and veh.seat and veh.seat.Parent then
         pcall(function() if floatOK then veh.seat.SteerFloat = 0 end end)
-        pcall(function() veh.seat.Steer = 0 end)   -- 关掉后方向归零, 交还玩家
+        pcall(function() veh.seat.Steer = 0 end)
     end
     curSteer = 0
     veh = nil
     diag.Visible = false
+    copyBtn.Visible = false
 end
 
 -- ==========================================
@@ -553,4 +823,4 @@ refresh()
 refreshAuto()
 enableView()
 
-print("WK 已就绪 (视野 + 自动转弯 V6 · 直写 SteerFloat · 屏幕诊断 · 零联网) [WK_VIEW_V6]")
+print("WK 已就绪 (视野 + 自动转弯 V7 · 水平障碍探路 · 自适应取证 · 零联网) [WK_VIEW_V7]")
