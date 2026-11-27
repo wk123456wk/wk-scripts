@@ -50,11 +50,12 @@ local COL = {
     green  = Color3.fromRGB(40, 175, 95),
     gray   = Color3.fromRGB(70, 74, 80),
 }
--- 通用怪物识别: 带Humanoid的非玩家模型 + 常见怪物名关键词
+-- 通用怪物识别: 带Humanoid的非玩家模型(最可靠) + 明确的怪物名关键词
+-- 注意: 不放 "it"/"the" 这类短词, 否则会误匹配 Building/Light/Exit 等普通物件
 local MONSTER_HINTS = {
     "monster","creature","enemy","zombie","killer","beast","entity","rake",
-    "pursuer","stalker","horror","demon","ghost","alien","boss","it","the ",
-    "怪","尸","幽灵","恶魔","追击","异形",
+    "pursuer","stalker","horror","demon","ghost","alien","seek","figure",
+    "怪","尸","幽灵","恶魔","追击","异形","巨兽","妖",
 }
 
 -- ==========================================
