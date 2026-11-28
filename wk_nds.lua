@@ -1,5 +1,15 @@
--- ===== WK 视野 + 自动转弯 V11 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
--- [WK_VIEW_V11] 根因 (用户 V10 完整诊断报告实锤, 7 轮盲试全废的原因):
+-- ===== WK 视野 + 自动转弯 V12 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
+-- [WK_VIEW_V12] 用户实测: 「确实转了, 但转得慢, 要撞到才转」→ 通道已验证生效(诊断 通道 fire1),
+--   本版【只修决策时机】, 转向通道 / 视野 / UI / 诊断渲染全部一字不动。
+--   病根 (3 个叠加, 全在探路+决策层, 与通道无关):
+--     (1) PROBE_LEN=55 太短: 弯道外侧护栏要开到很近才进射线; 之前 9 个方向全打满 55,
+--         得分只差中心偏好 → 恒「最佳+0°」判直路 (用户诊断 前方55stud 分14.6 实锤)
+--     (2) WALL_DANGER=18 固定硬阈值: 高速下 18 stud 只剩 0.2~0.3 秒, 物理来不及转
+--     (3) 平滑0.8 / 采样0.08 / 增益22: 舵量到位还要爬几拍
+--   => V12: 前探 55→130 + 速度自适应反应距离(越快越早打) + 侧向净空差渐进打舵
+--           + TURN_GAIN 15 / 平滑0.9 / 采样0.05; 前方近处无路仍满舵避险兜底
+--   [关键] 弯道还在 80~130 stud 外就开始打方向, 不再等贴到 18 stud 才满舵。
+-- V11 根因 (用户 V10 完整诊断报告实锤, 7 轮盲试全废的原因):
 --   【锁错了控件】V7~V10 一直锁定 "ThumbstickStart" (@66,246 R28), 它属于
 --   DynamicThumbstickFrame = Roblox 引擎默认的【角色走路摇杆】, 不是开车转向。
 --   报告 888 个候选里真正的转向控件是游戏自定义的【横向滑动转向条】:
@@ -48,7 +58,7 @@
 --             之后用同样格式重放脚本算出的舵量; 学到的名字显示在诊断里, 无需用户截图/复制
 -- 视野逻辑原样保留: 删高频 DescendantAdded 监听 + 字典查重 + 反制节流 + 10 秒低频巡检
 --   性能: 未开启零新增开销; 扫描只在开启/换车时一次; 每帧仅几次属性赋值
---   [WK_VIEW_V11]
+--   (V11 视野逻辑基线)
 
 local Lighting  = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
@@ -92,15 +102,20 @@ local STASH_MAX      = 200
 -- ==========================================
 -- 配置: 自动转弯 / 漂移  (V7 水平障碍探路)
 -- ==========================================
-local AUTO_TICK      = 0.08  -- 秒; 探路间隔
+local AUTO_TICK      = 0.05  -- 秒; V12 0.08→0.05 采样更密, 舵更快到位
 local PROBE_ANGLES   = {-75, -50, -28, -12, 0, 12, 28, 50, 75}  -- 度; 正=左, 负=右
-local PROBE_LEN      = 55    -- stud; 水平前探距离
+local PROBE_LEN      = 130   -- stud; V12 55→130 大幅提前看到弯道护栏/墙
 local PROBE_UP       = 2     -- 射线起点抬高 (避开地面)
-local WALL_DANGER    = 18    -- stud; 正前方障碍近于此 → 紧急满舵避险
-local TURN_GAIN_DEG  = 22    -- 度; 最佳方向偏离 22° 即打满舵 (越小越猛)
+local WALL_DANGER    = 22    -- stud; V12 18→22 前方近处无路 → 紧急满舵避险 (兜底)
+local TURN_GAIN_DEG  = 15    -- 度; V12 22→15 中等偏离即打满舵 (越小越猛)
 local STEER_SIGN     = 1     -- 车往反方向拐 → 改成 -1
 local STICK_SIGN     = 1     -- 摇杆左右拖反 → 改成 -1
-local STEER_SMOOTH   = 0.8
+local STEER_SMOOTH   = 0.9   -- V12 0.8→0.9 舵量几乎即时到位
+-- V12 新增: 速度自适应提前介入 (核心: 车速越快, 越早开始打方向)
+local REACT_TIME     = 1.1   -- 秒; 反应距离 = 车速(stud/s) × 该值 (越大越早)
+local REACT_MIN      = 30    -- stud; 反应距离下限 (低速也留基本提前量)
+local REACT_MAX      = 120   -- stud; 反应距离上限 (≤ PROBE_LEN, 保证射线探得到)
+local LEAD_GAP_MIN   = 0.12  -- 侧向净空差 > 反应距离×此值 才算真弯道 (防直路乱晃)
 local DRIFT_MIN_SPD  = 35
 local DRIFT_MIN_TURN = 0.45
 local DRIFT_SIDE     = 10
@@ -519,7 +534,7 @@ local function probeAhead(root, fw)
     ensureParams()
     local origin = root.Position + Vector3.new(0, PROBE_UP, 0)
     local bestDeg, bestScore = 0, -1
-    local frontDist = PROBE_LEN
+    local frontDist, bestDist = PROBE_LEN, PROBE_LEN
     for _, deg in ipairs(PROBE_ANGLES) do
         local dir = rotated(fw, deg)
         local d = PROBE_LEN
@@ -540,11 +555,47 @@ local function probeAhead(root, fw)
             if ok2 and g then ground = ground + (dd == 42 and 2 or 1) end
         end
         local score = (d / PROBE_LEN) * 10 + ground * 1.2 + (1 - math.abs(deg) / 90) * 1.0
-        if score > bestScore then bestScore, bestDeg = score, deg end
+        if score > bestScore then bestScore, bestDeg, bestDist = score, deg, d end
     end
-    return bestDeg, frontDist, bestScore
+    return bestDeg, frontDist, bestScore, bestDist
 end
 -- [TEST_BLOCK_END]
+
+-- [TEST_DECIDE_START]
+-- V12 决策纯函数 (可独立测试): 速度自适应提前介入 + 侧向净空差渐进打舵
+--   输入: deg=最空方向角 / frontDist=正前方可行距离 / bestDist=最空方向可行距离
+--         speed=车速(stud/s) / cur=上一拍舵量(用于选边兜底)
+--   返回: raw(目标舵 -1~1), reactDist(反应距离), mode(诊断字符串)
+--   <要点> 「前方进入反应距离」且「侧向明显更空」就提前打舵, 不再等 WALL_DANGER 才满舵。
+local function decideSteer(deg, frontDist, bestDist, speed, cur)
+    local reactDist = math.max(REACT_MIN, math.min(REACT_MAX, speed * REACT_TIME))
+    local raw, mode = 0, "直路"
+    if frontDist < WALL_DANGER then
+        -- 正前方近处无路: 满舵避险 (绝不回正直怼), 判不出方向时沿已有舵向选边
+        mode = "紧急满舵"
+        if deg ~= 0 then
+            raw = math.max(-1, math.min(1, -deg / TURN_GAIN_DEG))
+        else
+            raw = (math.abs(cur) > 0.05 and (cur > 0 and 1 or -1)) or 1
+        end
+        if math.abs(raw) < 0.85 then raw = raw >= 0 and 0.85 or -0.85 end
+    elseif frontDist < reactDist then
+        -- 墙还在「反应距离」内就提前打舵: 越近越急, 侧向净空越好打得越早越猛
+        local gap = bestDist - frontDist
+        local needTurn = gap > math.max(6, reactDist * LEAD_GAP_MIN)
+        local urgency = (reactDist - frontDist) / math.max(1, reactDist - WALL_DANGER)
+        urgency = math.max(0, math.min(1, urgency))
+        if deg ~= 0 and needTurn then
+            raw = math.max(-1, math.min(1, -deg / TURN_GAIN_DEG)) * (0.55 + 0.45 * urgency)
+            mode = "提前转向"
+        elseif deg ~= 0 then
+            raw = math.max(-1, math.min(1, -deg / TURN_GAIN_DEG)) * 0.4 * urgency
+            mode = "轻微预判"
+        end
+    end
+    return raw, reactDist, mode
+end
+-- [TEST_DECIDE_END]
 
 -- ===== 取证: 定位真实摇杆 / RemoteEvent / 转向 Value =====
 -- [TEST_STICK_START]
@@ -1094,20 +1145,15 @@ local function autoTick()
     veh = v
     bindVehicle(v)
     local fw = forwardOf(v.root, v.seat)
-    local deg, frontDist, score = probeAhead(v.root, fw)
-    probeInfo = string.format("最佳%+d° 前方%.0fstud 分%.1f", deg, frontDist, score)
-    local raw = 0
-    if frontDist < WALL_DANGER then
-        -- 正前方近处有墙: 朝最空方向满舵避险 (绝不回正直怼)
-        if deg ~= 0 then
-            raw = math.max(-1, math.min(1, -deg / TURN_GAIN_DEG))
-        else
-            raw = (math.abs(curSteer) > 0.05 and (curSteer > 0 and 1 or -1)) or 1
-        end
-        if math.abs(raw) < 0.85 then raw = raw >= 0 and 0.85 or -0.85 end
-    elseif deg ~= 0 then
-        raw = math.max(-1, math.min(1, -deg / TURN_GAIN_DEG))
-    end
+    local deg, frontDist, _, bestDist = probeAhead(v.root, fw)
+    local speed = 0
+    pcall(function()
+        local vel = v.root.AssemblyLinearVelocity
+        speed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+    end)
+    local raw, reactDist, mode = decideSteer(deg, frontDist, bestDist, speed, curSteer)
+    probeInfo = string.format("最佳%+d° 前%.0f 侧%.0f 反%.0f 速%.0f",
+        deg, frontDist, bestDist, reactDist, speed)
     local target = raw * STEER_SIGN
     curSteer = curSteer + (target - curSteer) * STEER_SMOOTH
     writeSeat(curSteer)
@@ -1123,8 +1169,7 @@ local function autoTick()
     local turning = math.abs(target) > 0.2
     if turning ~= wasTurning then
         wasTurning = turning
-        print("[WK] " .. (frontDist < WALL_DANGER and "前方障碍 → 满舵避险"
-            or (turning and "弯道 → 自动转向" or "直路 → 回正")))
+        print("[WK] " .. mode .. (turning and " → 自动转向" or " → 回正"))
     end
 end
 
@@ -1197,4 +1242,4 @@ refresh()
 refreshAuto()
 enableView()
 
-print("WK 已就绪 (视野 + 自动转弯 V11 · 精确接管 SteerZone/Knob 转向条 · 零联网) [WK_VIEW_V11]")
+print("WK 已就绪 (视野 + 自动转弯 V12 · 速度自适应提前转向 · 零联网) [WK_VIEW_V12]")
