@@ -1,5 +1,17 @@
--- ===== WK 视野 + 自动转弯 V12 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
--- [WK_VIEW_V12] 用户实测: 「确实转了, 但转得慢, 要撞到才转」→ 通道已验证生效(诊断 通道 fire1),
+-- ===== WK 视野 + 自动转弯 V13 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
+-- [WK_VIEW_V13] 用户实测: 「转弯乱抽搐根本转不好」→ 通道仍生效(诊断 通道 fire1 | fire OK),
+--   病根不在通道, 在【喂给通道的舵量高频左右横跳】:
+--     (1) deg 只有 9 个离散值, TURN_GAIN_DEG=15 → 最小 12° 偏离就给 0.8 舵;
+--         弯道护栏让 bestDeg 在相邻拍于 ±12/±28/±50 间跳 → 舵量 +满舵/0/-满舵 翻烧饼
+--     (2) STEER_SMOOTH=0.9 把每次跳变 90% 直送滑块 → 抖动放大
+--     (3)【物理正反馈·最致命】writeSeat 车身横摆扭矩每帧强设 AssemblyAngularVelocity.Y
+--         + doDrift 叠线速度/角速度 → 改车身朝向 → forwardOf 变 → 射线方向变 → deg 再跳 → 自激振荡
+--         (诊断「速1」低速车头仍抽, 正是扭矩强设角速度的铁证)
+--   => V13【只加决策层转向稳定器 + 切断物理扰动】, 输入通道/视野/UI/诊断渲染全部一字不动:
+--         角度死区 + 方向迟滞(换边需连续3拍反向证据) + 限斜率(每拍Δ有上限, 物理上抽不动)
+--         + 关车身扭矩 TRY_TORQUE=false / 关漂移 TRY_DRIFT=false (均留开关, 可设回 true)
+--         紧急满舵走单独更大斜率, 不拖慢避险; V12 的 130stud 提前量/反应距离全部保留
+-- V12 历史 (用户实测): 「确实转了, 但转得慢, 要撞到才转」→ 通道已验证生效(诊断 通道 fire1),
 --   本版【只修决策时机】, 转向通道 / 视野 / UI / 诊断渲染全部一字不动。
 --   病根 (3 个叠加, 全在探路+决策层, 与通道无关):
 --     (1) PROBE_LEN=55 太短: 弯道外侧护栏要开到很近才进射线; 之前 9 个方向全打满 55,
@@ -116,6 +128,13 @@ local REACT_TIME     = 1.1   -- 秒; 反应距离 = 车速(stud/s) × 该值 (�
 local REACT_MIN      = 30    -- stud; 反应距离下限 (低速也留基本提前量)
 local REACT_MAX      = 120   -- stud; 反应距离上限 (≤ PROBE_LEN, 保证射线探得到)
 local LEAD_GAP_MIN   = 0.12  -- 侧向净空差 > 反应距离×此值 才算真弯道 (防直路乱晃)
+-- V13 转向稳定器 (根治抽搐): 舵量每拍变化受限 + 方向迟滞 + 角度死区
+local SLEW_UP        = 0.20  -- 常态每拍最大增舵 (0.05s 一拍 → 约 4/s 平滑爬升)
+local SLEW_URGENT    = 0.55  -- 紧急满舵(前方近处无路)每拍最大增舵, 不拖慢避险
+local SLEW_DOWN      = 0.30  -- 每拍最大回舵
+local TURN_DEADZONE  = 0.18  -- 目标舵绝对值小于此 → 视为直路/噪声, 直接当 0
+local FLIP_HOLD      = 3     -- 想换转向边, 需连续 N 拍都指向反侧才允许 (防 ± 翻烧饼)
+-- 注: STEER_SMOOTH(0.9) 自 V13 起不再用于 autoTick, 改由 smoothSteer 的限斜率取代(保留作历史)
 local DRIFT_MIN_SPD  = 35
 local DRIFT_MIN_TURN = 0.45
 local DRIFT_SIDE     = 10
@@ -144,7 +163,8 @@ local TRY_FIRESIGNAL = true  -- firesignal 触发摇杆输入信号 (若执行�
 local TRY_KNOB       = true  -- 直接移动 knob 位置 (降级)
 local TRY_VALUES     = true  -- 写名字含 steer/turn/方向 的 Value
 local TRY_SEAT       = true  -- 写 SteerFloat / Steer (若座位支持)
-local TRY_TORQUE     = true  -- 车身横摆兜底
+local TRY_TORQUE     = false -- V13 关: 每帧强设车身角速度→改朝向→射线自激振荡(抽搐元凶); 留开关可设回 true
+local TRY_DRIFT      = false -- V13 关: 漂移叠线速度/角速度同理会扰动探路; 转向稳定后可设回 true
 local WRITE_FLOAT    = true
 local WRITE_INT      = true
 local EVERY_FRAME    = true
@@ -189,6 +209,8 @@ local steerZone, steerKnob, steerTrack, thumbEnd = nil, nil, nil, nil
 -- steerCenter 必须非 nil: startAuto() 的首次 updateDiag(true) 早于 findSteer() 执行
 local steerCenter, steerHalf, knobHome = Vector2.new(135, 235), 81, nil
 local steerDown, chanSteer = false, "未测"
+-- V13 转向稳定器跨拍状态: dir=当前转向边(-1/0/1), flip=连续反向证据拍数
+local steerSt = { dir = 0, flip = 0 }
 
 local function setP(obj, prop, val) pcall(function() obj[prop] = val end) end
 local function getP(obj, prop)
@@ -596,6 +618,44 @@ local function decideSteer(deg, frontDist, bestDist, speed, cur)
     return raw, reactDist, mode
 end
 -- [TEST_DECIDE_END]
+
+-- [TEST_SMOOTH_START]
+-- V13 转向稳定器 (纯函数, 可独立测试): 把 decideSteer 的暴力 target 整形成平滑舵量
+--   cur=当前实际舵量 / target=本拍原始目标(已乘 STEER_SIGN) / urgent=是否紧急满舵
+--   st=跨拍状态 {dir, flip}   返回: 平滑后的新舵量 (-1~1)
+--   三道防线: ①角度死区(小目标归零) ②方向迟滞(换边需连续 FLIP_HOLD 拍反向证据)
+--             ③限斜率(每拍 |Δ| 有上限, 物理上根本抽不动)
+local function smoothSteer(cur, target, urgent, st)
+    -- ① 死区: 直路/射线噪声产生的小目标一律归零, 杜绝直路乱转
+    if math.abs(target) < TURN_DEADZONE then target = 0 end
+    -- ② 方向迟滞: 想换边必须累积多拍反向证据, 单拍跳变不改向
+    local sign = (target > 0 and 1) or (target < 0 and -1) or 0
+    if urgent then
+        -- 紧急满舵(前方近处无路): 跳过迟滞立即响应, 限斜率(SLEW_URGENT)仍生效
+        if sign ~= 0 then st.dir, st.flip = sign, 0 end
+    elseif sign ~= 0 and st.dir ~= 0 and sign ~= st.dir then
+        st.flip = st.flip + 1
+        if st.flip < FLIP_HOLD then
+            target = 0                       -- 证据不足: 本拍不打反方向
+        else
+            st.dir, st.flip = sign, 0        -- 累积证据足够: 允许换边
+        end
+    else
+        if sign ~= 0 then
+            st.dir, st.flip = sign, 0        -- 同向证据: 回到原方向, 清零换边计数
+        end
+        -- sign==0(直路/射线噪声)弃权: 【不清零 flip】, 允许跨噪声累积反向证据,
+        --   避免护栏射线「-1,0,-1,0,-1」时永远换不了边 → 撞墙 (实测场景)
+    end
+    -- ③ 限斜率: 无论 target 跳多大, 每拍实际变化受限 (紧急时放宽)
+    local up = urgent and SLEW_URGENT or SLEW_UP
+    local lim = (math.abs(target) > math.abs(cur)) and up or SLEW_DOWN
+    local d = math.max(-lim, math.min(lim, target - cur))
+    local out = cur + d
+    if math.abs(out) < 0.02 then out = 0 end
+    return out
+end
+-- [TEST_SMOOTH_END]
 
 -- ===== 取证: 定位真实摇杆 / RemoteEvent / 转向 Value =====
 -- [TEST_STICK_START]
@@ -1072,9 +1132,9 @@ updateDiag = function(force)
     -- 完整报告 (点「复制诊断 / 翻页」会分页显示, 也可复制整段文本)
     local R = {}
     local function add(x) R[#R + 1] = clipLine(x, DIAG_W) end
-    add("=== WK V11 诊断报告 ===")
+    add("=== WK V13 诊断报告 ===")
     for _, x in ipairs(L) do add(x) end           -- 复用实时 12 短行, 不重复拼长句
-    add("--- V11 锁定对象 ---")
+    add("--- V13 锁定对象 ---")
     add("热区 " .. ((steerZone and steerZone.Name) or "未锁") ..
         " 滑块 " .. ((steerKnob and steerKnob.Name) or "-") ..
         " 槽 " .. ((steerTrack and steerTrack.Name) or "-"))
@@ -1092,9 +1152,9 @@ updateDiag = function(force)
     -- 复制到剪贴板的版本【不截断】: 完整对象名一次给全, 便于精确接管
     local F = {}
     local function addF(x) F[#F + 1] = x end
-    addF("=== WK V11 完整诊断 (未截断·已滤噪音) ===")
+    addF("=== WK V13 完整诊断 (未截断·已滤噪音) ===")
     for _, x in ipairs(L) do addF(x) end
-    addF("--- V11 锁定对象 ---")
+    addF("--- V13 锁定对象 ---")
     addF("热区 " .. ((steerZone and steerZone.Name) or "未锁") ..
          " 滑块 " .. ((steerKnob and steerKnob.Name) or "-") ..
          " 槽 " .. ((steerTrack and steerTrack.Name) or "-") ..
@@ -1155,7 +1215,8 @@ local function autoTick()
     probeInfo = string.format("最佳%+d° 前%.0f 侧%.0f 反%.0f 速%.0f",
         deg, frontDist, bestDist, reactDist, speed)
     local target = raw * STEER_SIGN
-    curSteer = curSteer + (target - curSteer) * STEER_SMOOTH
+    local urgent = (mode == "紧急满舵")
+    curSteer = smoothSteer(curSteer, target, urgent, steerSt)
     writeSeat(curSteer)
     applyValues(curSteer)
     applyTouch(curSteer)
@@ -1164,7 +1225,7 @@ local function autoTick()
     applyFireSignal(curSteer)
     applyKnob(curSteer)
     applySteerZone(curSteer)
-    doDrift(v.root, fw, curSteer)
+    if TRY_DRIFT then doDrift(v.root, fw, curSteer) end
     updateDiag()
     local turning = math.abs(target) > 0.2
     if turning ~= wasTurning then
@@ -1180,6 +1241,7 @@ local function startAuto()
     copyBtn.Visible = DIAG
     copyBtn.Text = "复制诊断 / 翻页"
     showingReport, reportPage = false, 1
+    steerSt.dir, steerSt.flip = 0, 0        -- V13 每次开启重置稳定器
     installHook()
     startFrameWriter()
     updateDiag(true)
@@ -1206,6 +1268,7 @@ local function stopAuto()
         pcall(function() veh.seat.Steer = 0 end)
     end
     curSteer = 0
+    steerSt.dir, steerSt.flip = 0, 0        -- V13
     veh = nil
     diag.Visible = false
     copyBtn.Visible = false
@@ -1242,4 +1305,4 @@ refresh()
 refreshAuto()
 enableView()
 
-print("WK 已就绪 (视野 + 自动转弯 V12 · 速度自适应提前转向 · 零联网) [WK_VIEW_V12]")
+print("WK 已就绪 (视野 + 自动转弯 V13 · 转向稳定器防抽搐 · 零联网) [WK_VIEW_V13]")
