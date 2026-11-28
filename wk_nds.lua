@@ -1,5 +1,17 @@
--- ===== WK 视野 + 自动转弯 V9 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
+-- ===== WK 视野 + 自动转弯 V10 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
 -- 适用: 「不要停止 / make sure to drive fast」等雨夜浓雾黑夜驾驶地图
+-- V10 修正 V9 的实测问题 (用户实测截图: 每行右侧仍被裁断, 底部按钮又只露一半):
+--   [问题1] TextWrapped=false + 固定像素宽310 + 每行30+字符(含中文), 手机 DPI 放大后
+--           文字宽 > 框宽 -> 每行尾部被【横向裁断】("触摸 被拒..." / "firesign..." /
+--           "车身 Chass..."); 且 V9 的 clipLine 只作用于分页报告, 实时8行没走截断
+--   [问题2] 翻页按钮 y=286 固定像素, 在这台设备上超出屏幕底边 -> 又被切一半
+--   -> 布局改为【运行时读真实 Camera.ViewportSize】动态计算: 框高 = 屏高 - 顶栏 - 底边距,
+--      按钮固定在右上角顶部 (绝不掉出屏幕), 框宽按屏宽比例钳制, 不再猜 DPI/分辨率
+--   -> 截断升级为按【显示宽度】(ASCII=1 / 中文全角=2), 且实时状态改为「一行一个属性」
+--      共12个短行, 全部过截断, 任何设备都不会横向裁断
+--   -> 报告列出全部 RemoteEvent 名字 (上限 40->60), 便于一次复制取证
+--   [实测诊断] 座位 普通Seat/无属性 · 车 Car_8406302455 · 摇杆 ThumbstickStart @66,246 R28
+--              UIS 可用 · 触摸 被拒 · 学习 - · 候选 R39 V0 · knob OK
 -- V9 修正 V8 的实测问题 (用户: 「属性看不完，建议移到右上角」):
 --   [问题] 诊断框在左下角 272x92 / 字号13, 手机 DPI 放大后一页只露出标题+1行,
 --          底部被屏幕裁掉; 每页仅4行, 完整属性清单共28页, 根本翻不完 (截图实锤)
@@ -22,7 +34,7 @@
 --             之后用同样格式重放脚本算出的舵量; 学到的名字显示在诊断里, 无需用户截图/复制
 -- 视野逻辑原样保留: 删高频 DescendantAdded 监听 + 字典查重 + 反制节流 + 10 秒低频巡检
 --   性能: 未开启零新增开销; 扫描只在开启/换车时一次; 每帧仅几次属性赋值
---   [WK_VIEW_V9]
+--   [WK_VIEW_V10]
 
 local Lighting  = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
@@ -100,7 +112,7 @@ local WRITE_INT      = true
 local EVERY_FRAME    = true
 local HINGE_ANGLE    = 30
 local DIAG           = true  -- 屏幕诊断 (确认工作后可改 false 隐藏)
-local LINES_PER_PAGE = 12   -- V9: 报告每页行数 (原 4, 页数 28->约10)
+local LINES_PER_PAGE = 12   -- V10: 运行时按真实屏高动态覆盖 (见下方布局块)
 
 -- ==========================================
 -- 状态
@@ -174,71 +186,91 @@ end
 local btn     = mkBtn(0,  "WK 视野：关")
 local btnAuto = mkBtn(54, "自动转弯：关")
 
--- ===== 屏幕诊断 (V9): 右上角 / 12行每页 / 不换行 / 固定像素, 绝不溢出屏幕 =====
+-- ===== 屏幕诊断 (V10): 右上角 / 运行时按真实屏高布局 / 每行按显示宽度截断 =====
 local diag = Instance.new("TextButton")       -- 点诊断框本身也能复制/翻页
 diag.Name = "WK_Diag"
-diag.Size = UDim2.new(0, 310, 0, 268)
 diag.AnchorPoint = Vector2.new(1, 0)          -- 右上角为锚点: 框向左下展开
-diag.Position = UDim2.new(1, -12, 0, 12)     -- 距右边 12 / 距顶 12, 恒在屏幕内
 diag.BackgroundColor3 = Color3.fromRGB(12, 16, 20)
-diag.BackgroundTransparency = 0.35           -- 更透, 少挡右上角速度表
+diag.BackgroundTransparency = 0.42           -- 更透, 少挡右上角速度表
 diag.BorderSizePixel = 0
 diag.Font = Enum.Font.GothamBold
-diag.TextSize = 11                           -- 缩小字号, 一页装得下 12 行
+diag.TextSize = 9                            -- 缩小字号: 一页装更多行, 更不易横向溢出
 diag.TextColor3 = Color3.fromRGB(170, 235, 185)
 diag.TextXAlignment = Enum.TextXAlignment.Left
 diag.TextYAlignment = Enum.TextYAlignment.Top
-diag.TextWrapped = false                     -- 关键: 关掉自动换行, 杜绝溢出
+diag.TextWrapped = false                     -- 不换行 (靠下方截断保证每行不超宽)
 diag.Text = "诊断待开启"
 diag.Visible = false
 diag.Parent = gui
 pcall(function() Instance.new("UICorner", diag).CornerRadius = UDim.new(0, 8) end)
 
--- 翻页按钮 (V9): 紧跟右上角诊断框【下方】, 同样右对齐, 与报告组成一块面板
+-- 翻页按钮 (V10): 固定在【右上角顶部】, 与屏幕顶边绑定, 绝不掉出屏幕
 local copyBtn = Instance.new("TextButton")
 copyBtn.Name = "WK_Copy"
-copyBtn.Size = UDim2.new(0, 200, 0, 38)
 copyBtn.AnchorPoint = Vector2.new(1, 0)
-copyBtn.Position = UDim2.new(1, -12, 0, 286)     -- diag 底 = 12+268 = 280, 留 6px 间距
 copyBtn.BackgroundColor3 = Color3.fromRGB(60, 105, 190)
 copyBtn.BorderSizePixel = 0
 copyBtn.Font = Enum.Font.GothamBold
 copyBtn.Text = "复制诊断 / 翻页"
 copyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 copyBtn.TextSize = 12
+-- 尺寸/位置由下方动态布局块统一赋值
 copyBtn.Visible = false
 copyBtn.Parent = gui
 pcall(function() Instance.new("UICorner", copyBtn).CornerRadius = UDim.new(0, 22) end)
 
--- 极小屏钳制: 保证「框 + 按钮」整块恒在屏幕内, 并同步下调每页行数
+-- V10 动态布局: 用【真实】Camera.ViewportSize 计算, 不再猜设备 DPI / 固定像素
+--   顶栏(按钮) + 间距 + 框 + 底边距 = 屏高, 因此整块永远完整在屏幕内
+local DIAG_W, BOX_W = 34, 310                 -- 每行最大显示宽度 / 框宽基准
 do
-    local ok, vp = pcall(function()
+    local vp
+    pcall(function()
         local c = Workspace.CurrentCamera
-        return c and c.ViewportSize
+        if c then vp = c.ViewportSize end
     end)
-    if ok and vp and vp.Y > 0 and vp.Y < 340 then
-        local h = math.max(150, math.floor(vp.Y - 76))
-        diag.Size = UDim2.new(0, 310, 0, h)
-        copyBtn.Position = UDim2.new(1, -12, 0, h + 18)
-        LINES_PER_PAGE = math.max(5, math.min(12, math.floor(h / 22)))
-    end
+    local VX = (vp and vp.X > 0) and vp.X or 800
+    local VY = (vp and vp.Y > 0) and vp.Y or 600
+    local TOP, BTN_H, GAP, BOTTOM = 12, 38, 6, 14
+    BOX_W  = math.max(210, math.min(360, math.floor(VX * 0.46)))
+    local boxH = math.max(140, VY - TOP - BTN_H - GAP - BOTTOM)
+    copyBtn.Size     = UDim2.new(0, math.min(210, BOX_W), 0, BTN_H)
+    copyBtn.Position = UDim2.new(1, -12, 0, TOP)
+    diag.Size        = UDim2.new(0, BOX_W, 0, boxH)
+    diag.Position    = UDim2.new(1, -12, 0, TOP + BTN_H + GAP)
+    -- 每行约 15 逻辑像素高, 按真实框高算每页行数 (6~16 行)
+    LINES_PER_PAGE   = math.max(6, math.min(16, math.floor((boxH - 10) / 15)))
+    DIAG_W           = math.max(22, math.min(46, math.floor(BOX_W / 9)))
 end
 
--- 按【字节宽度】截断长行, 逐字符累加预算, 保证 UTF-8 字符边界完整
-local function clipLine(x, n)
+-- 按【显示宽度】截断长行: ASCII=1 / 中文全角=2, 逐字符累加预算,
+-- 保证 UTF-8 字符边界完整且绝不横向溢出框宽 (TextWrapped=false 下的唯一保险)
+local function clipLine(x, maxW)
     x = tostring(x)
-    if #x <= n then return x end
-    local budget = n - 3
-    local i, used = 1, 0
+    -- 先算整行显示宽度: 放得下就原样返回, 避免「明明没超宽却加省略号」
+    local total, k = 0, 1
+    while k <= #x do
+        local c = x:byte(k)
+        local n = 1
+        if c >= 0xF0 then n = 4
+        elseif c >= 0xE0 then n = 3
+        elseif c >= 0xC0 then n = 2 end
+        total = total + ((n == 1) and 1 or 2)
+        k = k + n
+    end
+    if total <= maxW then return x end
+    -- 真超宽: 逐字符累加到 budget (预留 3 给 "..."), 保证 UTF-8 边界完整
+    local i, w = 1, 0
+    local budget = maxW - 3
     while i <= #x do
         local c = x:byte(i)
-        local w = 1
-        if c >= 0xF0 then w = 4
-        elseif c >= 0xE0 then w = 3
-        elseif c >= 0xC0 then w = 2 end
-        if used + w > budget then break end   -- 该字符放不下就停, 绝不留半个字符
-        used = used + w
-        i = i + w
+        local n = 1
+        if c >= 0xF0 then n = 4
+        elseif c >= 0xE0 then n = 3
+        elseif c >= 0xC0 then n = 2 end
+        local dw = (n == 1) and 1 or 2        -- 显示宽度
+        if w + dw > budget then break end
+        w = w + dw
+        i = i + n
     end
     return x:sub(1, i - 1) .. "..."
 end
@@ -827,41 +859,36 @@ updateDiag = function(force)
     if not force and now - diagT < 0.3 then return end
     diagT = now
     local seatType = veh and (veh.isVehicleSeat and "VehicleSeat" or "普通Seat") or "未坐车"
-    -- 实时状态 8 行 (V9): 关键属性常显, 不点翻页也能一次看全
-    local l1 = string.format("座位 %s | 目标 %+.2f", seatType, curSteer)
-    local l2 = probeInfo
-    local l3 = string.format("摇杆 %s | 触摸 %s",
-        (stick and stick.Name) or "未锁定", chanTouch)
-    local l4 = string.format("UIS %s | 学习 %s | 候选 R%d V%d",
-        (uisOK and "可用" or "不可用"), learnedName, #remoteObjs, #stickVals)
-    local l5 = "座位属性 " .. chanSeat .. " | firesignal " .. chanFire
-    local l6 = "通道 knob " .. chanKnob .. " / Val " .. chanVal
-    local l7 = "车 " .. ((veh and veh.model and veh.model.Name) or "无") ..
-        " | 车身 " .. ((veh and veh.body and veh.body.Name) or "无")
-    local l8 = "摇杆中心 " .. ((stickCenter and string.format("%.0f,%.0f R%.0f",
-        stickCenter.X, stickCenter.Y, stickRadius)) or "-")
-    if not showingReport then
-        diag.Text = l1 .. "\n" .. l2 .. "\n" .. l3 .. "\n" .. l4 ..
-            "\n" .. l5 .. "\n" .. l6 .. "\n" .. l7 .. "\n" .. l8
-    end
-
-    -- 完整报告 (点「复制诊断 / 翻页」会分页显示在屏幕上, 不依赖剪贴板)
+    -- 实时状态 (V10): 一行一个属性, 12 个短行, 每行按显示宽度截断, 绝不横向裁断
     local L = {}
-    local function add(x) L[#L + 1] = clipLine(x, 46) end
-    add("=== WK V9 诊断报告 ===")
-    add(l1); add(l2); add(l3); add(l4); add(l5); add(l6); add(l7); add(l8)
-    add("座位属性: " .. chanSeat .. " | firesignal: " .. chanFire)
-    add("通道 knob " .. chanKnob .. " / Val " .. chanVal)
-    add("车模型: " .. ((veh and veh.model and veh.model.Name) or "无"))
-    add("车身部件: " .. ((veh and veh.body and veh.body.Name) or "无PrimaryPart"))
-    add("摇杆中心: " .. ((stickCenter and string.format("%.0f,%.0f R%.0f",
+    local function put(x) L[#L + 1] = clipLine(x, DIAG_W) end
+    put("座位 " .. seatType)
+    put(string.format("目标 %+.2f", curSteer))
+    put(probeInfo)
+    put("摇杆 " .. ((stick and stick.Name) or "未锁定"))
+    put("触摸 " .. chanTouch)
+    put("UIS " .. (uisOK and "可用" or "不可用") .. " fire " .. chanFire)
+    put("学习 " .. learnedName .. " 候选 R" .. #remoteObjs .. " V" .. #stickVals)
+    put("座位属性 " .. chanSeat)
+    put("knob " .. chanKnob .. " Val " .. chanVal)
+    put("车 " .. ((veh and veh.model and veh.model.Name) or "无"))
+    put("车身 " .. ((veh and veh.body and veh.body.Name) or "无"))
+    put("摇杆中心 " .. ((stickCenter and string.format("%.0f,%.0f R%.0f",
         stickCenter.X, stickCenter.Y, stickRadius)) or "-"))
+    local stateText = table.concat(L, "\n")
+    if not showingReport then diag.Text = stateText end
+
+    -- 完整报告 (点「复制诊断 / 翻页」会分页显示, 也可复制整段文本)
+    local R = {}
+    local function add(x) R[#R + 1] = clipLine(x, DIAG_W) end
+    add("=== WK V10 诊断报告 ===")
+    for _, x in ipairs(L) do add(x) end           -- 复用实时 12 短行, 不重复拼长句
     add("--- 摇杆候选 (" .. #stickCands .. ") ---")
-    for i, x in ipairs(stickCands) do if i <= 10 then add(x) end end
+    for i, x in ipairs(stickCands) do if i <= 12 then add(x) end end
     add("--- RemoteEvent (" .. #remoteNames .. ") ---")
-    for i, x in ipairs(remoteNames) do if i <= 40 then add(x) end end
+    for i, x in ipairs(remoteNames) do if i <= 60 then add(x) end end
     add("--- 转向 Value (" .. #valueNames .. ") ---")
-    for i, x in ipairs(valueNames) do if i <= 10 then add(x) end end
+    for i, x in ipairs(valueNames) do if i <= 12 then add(x) end end
     add("--- ScreenGui ---")
     pcall(function()
         for _, parent in ipairs({PlayerGui, CoreGui}) do
@@ -872,9 +899,20 @@ updateDiag = function(force)
             end
         end
     end)
-    add("=== 学到 " .. learnedName .. " | 报告共 " .. #L .. " 行 ===")
-    reportLines = L
-    fullReport = table.concat(L, "\n")
+    add("=== 学到 " .. learnedName .. " | 报告共 " .. #R .. " 行 ===")
+    reportLines = R
+    -- 复制到剪贴板的版本【不截断】: 完整对象名一次给全, 便于精确接管
+    local F = {}
+    local function addF(x) F[#F + 1] = x end
+    addF("=== WK V10 完整诊断 (未截断) ===")
+    for _, x in ipairs(L) do addF(x) end
+    addF("--- RemoteEvent (" .. #remoteNames .. ") ---")
+    for _, x in ipairs(remoteNames) do addF(x) end
+    addF("--- 摇杆候选 (" .. #stickCands .. ") ---")
+    for _, x in ipairs(stickCands) do addF(x) end
+    addF("--- 转向 Value (" .. #valueNames .. ") ---")
+    for _, x in ipairs(valueNames) do addF(x) end
+    fullReport = table.concat(F, "\n")
     if showingReport then
         local pages = math.max(1, math.ceil(#reportLines / LINES_PER_PAGE))
         if reportPage > pages then reportPage = 1 end
@@ -1012,4 +1050,4 @@ refresh()
 refreshAuto()
 enableView()
 
-print("WK 已就绪 (视野 + 自动转弯 V9 · 诊断移到右上角/12行每页 · ThumbstickStart通道 · 零联网) [WK_VIEW_V9]")
+print("WK 已就绪 (视野 + 自动转弯 V10 · 诊断动态布局/短行不裁断 · ThumbstickStart通道 · 零联网) [WK_VIEW_V10]")
