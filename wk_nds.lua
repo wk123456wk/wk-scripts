@@ -1,5 +1,15 @@
--- ===== WK 视野 + 自动转弯 V13 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
--- [WK_VIEW_V13] 用户实测: 「转弯乱抽搐根本转不好」→ 通道仍生效(诊断 通道 fire1 | fire OK),
+-- ===== WK 视野 + 自动转弯 V14 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
+-- [WK_VIEW_V14] 用户实测: 「转弯确实好了, 但还是转不过去」→ 抽搐已治好(通道 fire1 稳),
+--   病根在【决策层把弯道判成直路】, 与已生效的输入通道无关:
+--     诊断帧「最佳+12° 前100 侧130 反30 速0 → 目标 +0.00」实锤:
+--       reactDist = clamp(速0×1.1) = 30; frontDist(100) 既 ≥ WALL_DANGER(22) 又 ≥ reactDist(30)
+--       → 紧急满舵 / 提前转向两个分支全不进 → raw=0 判「直路」→ 不打方向。
+--     过弯本就要减速, 车速越低 reactDist 越小, 前方 100 stud 的弯道越被判直路 (V12 设计的反效果)。
+--     叠加: deg 仅 +12°(中心偏好)→中等舵被 V13 死区0.18/限斜率0.20 压住; deg 跳0 时中途回正。
+--   => V14【只重写 decideSteer】: 新增几何弯道判定 gap = bestDist-frontDist > NEED_GAP(16)
+--      即判该转【与车速完全解耦】; 给持续下限0.60的大舵(越近越满), deg=0 沿用上拍方向不回正。
+--      V13 稳定器/死区/迟滞/限斜率/关扭矩、探路评分、全部通道、视野、UI、诊断渲染【一字不动】。
+-- V13 历史 (用户实测): 「转弯乱抽搐根本转不好」→ 通道仍生效(诊断 通道 fire1 | fire OK),
 --   病根不在通道, 在【喂给通道的舵量高频左右横跳】:
 --     (1) deg 只有 9 个离散值, TURN_GAIN_DEG=15 → 最小 12° 偏离就给 0.8 舵;
 --         弯道护栏让 bestDeg 在相邻拍于 ±12/±28/±50 间跳 → 舵量 +满舵/0/-满舵 翻烧饼
@@ -128,6 +138,9 @@ local REACT_TIME     = 1.1   -- 秒; 反应距离 = 车速(stud/s) × 该值 (�
 local REACT_MIN      = 30    -- stud; 反应距离下限 (低速也留基本提前量)
 local REACT_MAX      = 120   -- stud; 反应距离上限 (≤ PROBE_LEN, 保证射线探得到)
 local LEAD_GAP_MIN   = 0.12  -- 侧向净空差 > 反应距离×此值 才算真弯道 (防直路乱晃)
+-- V14 弯道判定 (治「转不过去」): 几何驱动, 与车速解耦
+local NEED_GAP       = 16    -- stud; 正前方比侧向最空方向近这么多 → 判定前方受阻/弯道 (不看车速)
+local TURN_MIN       = 0.60  -- 弯道持续舵量下限 (越接近墙越满舵), 保证转得过, 不被死区吃掉
 -- V13 转向稳定器 (根治抽搐): 舵量每拍变化受限 + 方向迟滞 + 角度死区
 local SLEW_UP        = 0.20  -- 常态每拍最大增舵 (0.05s 一拍 → 约 4/s 平滑爬升)
 local SLEW_URGENT    = 0.55  -- 紧急满舵(前方近处无路)每拍最大增舵, 不拖慢避险
@@ -591,29 +604,36 @@ end
 --   <要点> 「前方进入反应距离」且「侧向明显更空」就提前打舵, 不再等 WALL_DANGER 才满舵。
 local function decideSteer(deg, frontDist, bestDist, speed, cur)
     local reactDist = math.max(REACT_MIN, math.min(REACT_MAX, speed * REACT_TIME))
+    local gap = bestDist - frontDist          -- 侧向最空方向比正前多出的净空
     local raw, mode = 0, "直路"
+
+    -- 选边: deg>0(左侧空)→负舵, deg<0(右侧空)→正舵 (与 V11~V13 实测方向一致)
+    --   deg==0(护栏射线噪声)→沿用上一拍舵向, 弯道中途绝不回正
+    local side
+    if deg > 0 then side = -1
+    elseif deg < 0 then side = 1
+    else side = (math.abs(cur) > 0.05 and (cur > 0 and 1 or -1)) or 1 end
+
     if frontDist < WALL_DANGER then
-        -- 正前方近处无路: 满舵避险 (绝不回正直怼), 判不出方向时沿已有舵向选边
+        -- ① 紧急满舵 (正前方近处无路): 保留 V12/V13 兜底, 绝不回正直怼
         mode = "紧急满舵"
-        if deg ~= 0 then
-            raw = math.max(-1, math.min(1, -deg / TURN_GAIN_DEG))
-        else
-            raw = (math.abs(cur) > 0.05 and (cur > 0 and 1 or -1)) or 1
-        end
+        raw = side
         if math.abs(raw) < 0.85 then raw = raw >= 0 and 0.85 or -0.85 end
-    elseif frontDist < reactDist then
-        -- 墙还在「反应距离」内就提前打舵: 越近越急, 侧向净空越好打得越早越猛
-        local gap = bestDist - frontDist
-        local needTurn = gap > math.max(6, reactDist * LEAD_GAP_MIN)
+    elseif gap > NEED_GAP then
+        -- ② 几何弯道判定 (V14 核心): 前方比侧向净空差 > NEED_GAP 即判定该转,
+        --    【与车速完全解耦】——过弯减速 / 静止也照转, 修「前100 侧130 速0 → 目标+0.00」
+        --    舵量下限 TURN_MIN, 越接近墙越满舵: 持续大舵才转得过弯, 不被死区吃掉
+        local close = (PROBE_LEN - frontDist) / math.max(1, PROBE_LEN - WALL_DANGER)
+        close = math.max(0, math.min(1, close))
+        local strength = TURN_MIN + (1 - TURN_MIN) * close
+        raw = side * strength
+        mode = "弯道持续"
+    elseif frontDist < reactDist and deg ~= 0 then
+        -- ③ 提前量 (高速更早介入, V12 能力保留): 侧向净空差还不够大时的轻微预判
         local urgency = (reactDist - frontDist) / math.max(1, reactDist - WALL_DANGER)
         urgency = math.max(0, math.min(1, urgency))
-        if deg ~= 0 and needTurn then
-            raw = math.max(-1, math.min(1, -deg / TURN_GAIN_DEG)) * (0.55 + 0.45 * urgency)
-            mode = "提前转向"
-        elseif deg ~= 0 then
-            raw = math.max(-1, math.min(1, -deg / TURN_GAIN_DEG)) * 0.4 * urgency
-            mode = "轻微预判"
-        end
+        raw = math.max(-1, math.min(1, -deg / TURN_GAIN_DEG)) * 0.4 * urgency
+        mode = "轻微预判"
     end
     return raw, reactDist, mode
 end
@@ -1132,9 +1152,9 @@ updateDiag = function(force)
     -- 完整报告 (点「复制诊断 / 翻页」会分页显示, 也可复制整段文本)
     local R = {}
     local function add(x) R[#R + 1] = clipLine(x, DIAG_W) end
-    add("=== WK V13 诊断报告 ===")
+    add("=== WK V14 诊断报告 ===")
     for _, x in ipairs(L) do add(x) end           -- 复用实时 12 短行, 不重复拼长句
-    add("--- V13 锁定对象 ---")
+    add("--- V14 锁定对象 ---")
     add("热区 " .. ((steerZone and steerZone.Name) or "未锁") ..
         " 滑块 " .. ((steerKnob and steerKnob.Name) or "-") ..
         " 槽 " .. ((steerTrack and steerTrack.Name) or "-"))
@@ -1152,9 +1172,9 @@ updateDiag = function(force)
     -- 复制到剪贴板的版本【不截断】: 完整对象名一次给全, 便于精确接管
     local F = {}
     local function addF(x) F[#F + 1] = x end
-    addF("=== WK V13 完整诊断 (未截断·已滤噪音) ===")
+    addF("=== WK V14 完整诊断 (未截断·已滤噪音) ===")
     for _, x in ipairs(L) do addF(x) end
-    addF("--- V13 锁定对象 ---")
+    addF("--- V14 锁定对象 ---")
     addF("热区 " .. ((steerZone and steerZone.Name) or "未锁") ..
          " 滑块 " .. ((steerKnob and steerKnob.Name) or "-") ..
          " 槽 " .. ((steerTrack and steerTrack.Name) or "-") ..
@@ -1305,4 +1325,4 @@ refresh()
 refreshAuto()
 enableView()
 
-print("WK 已就绪 (视野 + 自动转弯 V13 · 转向稳定器防抽搐 · 零联网) [WK_VIEW_V13]")
+print("WK 已就绪 (视野 + 自动转弯 V14 · 几何弯道判定治转不过去 · 零联网) [WK_VIEW_V14]")
