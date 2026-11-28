@@ -1,4 +1,18 @@
--- ===== WK 视野 + 自动转弯 V10 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
+-- ===== WK 视野 + 自动转弯 V11 (去雾白昼 · 弯道自动转向/漂移 · 零联网秒启动) =====
+-- [WK_VIEW_V11] 根因 (用户 V10 完整诊断报告实锤, 7 轮盲试全废的原因):
+--   【锁错了控件】V7~V10 一直锁定 "ThumbstickStart" (@66,246 R28), 它属于
+--   DynamicThumbstickFrame = Roblox 引擎默认的【角色走路摇杆】, 不是开车转向。
+--   报告 888 个候选里真正的转向控件是游戏自定义的【横向滑动转向条】:
+--     SteerZone [TextButton] 0,93 322x208   <- 转向触摸热区 (名字直译"转向区")
+--     Track     [Frame]      27,229 216x12  <- 滑槽, 中心 X = 27+108 = 135
+--     Knob      [Frame]      108,208 54x54  <- 滑块, 中心 X = 108+27 = 135
+--   两者中心精确重合 = 回正位; 可移动半程 = (216-54)/2 = 81。
+--   ThumbstickEnd [ImageLabel] 48,228 36x36 是默认摇杆把手 (备选兼容)。
+--   报告另确认: 触摸 被拒绝(VIM 无权限) / UIS 可用 fire OK(firesignal 可用) /
+--     学习 -(静止时无转向远程) / Val 无对象 / 座位 普通Seat/无属性 / 前方55stud(直路)。
+--   => V11: 精确锁定 SteerZone+Knob, 把已有的 firesignal/UIS/触摸通道【全部校正到
+--      真实转向控件】, 补齐缺失的 InputBegan 手势, 直写 Knob.Position, 每条通道结果上屏。
+--   => 报告精简: 888 个噪音候选(Scanline/Dot/Selection)过滤, 只留转向相关 + 疑似转向 Remote。
 -- 适用: 「不要停止 / make sure to drive fast」等雨夜浓雾黑夜驾驶地图
 -- V10 修正 V9 的实测问题 (用户实测截图: 每行右侧仍被裁断, 底部按钮又只露一半):
 --   [问题1] TextWrapped=false + 固定像素宽310 + 每行30+字符(含中文), 手机 DPI 放大后
@@ -34,7 +48,7 @@
 --             之后用同样格式重放脚本算出的舵量; 学到的名字显示在诊断里, 无需用户截图/复制
 -- 视野逻辑原样保留: 删高频 DescendantAdded 监听 + 字典查重 + 反制节流 + 10 秒低频巡检
 --   性能: 未开启零新增开销; 扫描只在开启/换车时一次; 每帧仅几次属性赋值
---   [WK_VIEW_V10]
+--   [WK_VIEW_V11]
 
 local Lighting  = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
@@ -96,7 +110,16 @@ local TORQUE_YAW     = 1.6
 -- ==========================================
 -- 配置: 转向输出 (V7 自适应取证 + 多通道)
 -- ==========================================
-local STICK_NAME     = "ThumbstickStart"  -- V7 诊断实测到的真实摇杆名 (Roblox 默认动态摇杆)
+-- V11: 依据完整诊断报告, 精确锁定游戏自定义转向条 (不再把走路摇杆当转向控件)
+local STEER_ZONE_NAME = "SteerZone"      -- 转向触摸热区 (TextButton 0,93 322x208)
+local KNOB_NAME       = "Knob"           -- 滑块把手 (Frame 108,208 54x54)
+local TRACK_NAME      = "Track"          -- 横向滑槽 (Frame 27,229 216x12)
+local THUMB_END_NAME  = "ThumbstickEnd"  -- 默认摇杆把手 (备选兼容)
+local STEER_HALF      = 0                -- 0=按 (Track宽-Knob宽)/2 自动算(报告=81); 也可填固定值
+local TRY_STEER       = true             -- 主通道: firesignal 伪造 SteerZone 输入 + 直写 Knob
+local SUSPECT_REMOTES = { TurnCall=true, SetHandling=true, SetAutoGas=true, RunEvent=true,
+                          StartRun=true, LineCross=true, Crank=true, DriftHintSeen=true }
+local STICK_NAME     = ""    -- 置空: 由 findSteer 精确锁定; 需强制指定某对象时填名字
 local STICK_RADIUS   = 0     -- 0=按摇杆尺寸自动算; 也可填固定像素如 70
 local TRY_TOUCH      = true  -- VirtualInputManager 触摸注入 (带成功/失败回显)
 local TRY_UIS        = true  -- firesignal 伪造 UserInputService.TouchMoved (默认摇杆真正读的输入)
@@ -146,6 +169,11 @@ local uisOK, hookOK, learnedName, learnedIdx = false, false, "-", 0
 local learnedRemote, learnedSample = nil, nil
 local updateDiag
 local getFireSignal          -- 前向声明: 供 applyFireSignal / applyUIS / bindVehicle 共用同一 upvalue
+-- V11: 精确锁定的转向控件 (与 findStick 的 stick 系列分开, 避免 knobBase 被覆盖)
+local steerZone, steerKnob, steerTrack, thumbEnd = nil, nil, nil, nil
+-- steerCenter 必须非 nil: startAuto() 的首次 updateDiag(true) 早于 findSteer() 执行
+local steerCenter, steerHalf, knobHome = Vector2.new(135, 235), 81, nil
+local steerDown, chanSteer = false, "未测"
 
 local function setP(obj, prop, val) pcall(function() obj[prop] = val end) end
 local function getP(obj, prop)
@@ -556,6 +584,8 @@ local function findStick(vpX, vpY)
             if o and o:IsA("GuiObject") then best = o end
         end)
     end
+    -- V11: 校正到真实转向热区 -> applyFireSignal/applyUIS/applyTouch 的坐标与对象随之全部对准
+    if steerZone then best = steerZone end
     if best then
         stick = best
         local pos, sz = best.AbsolutePosition, best.AbsoluteSize
@@ -567,6 +597,45 @@ local function findStick(vpX, vpY)
     return best
 end
 -- [TEST_STICK_END]
+
+-- V11 精确锁定: 报告实锤的 4 个对象 (按名字递归找, 排除脚本自己的 gui)
+-- [TEST_STEER_START]
+local function findSteer()
+    steerZone, steerKnob, steerTrack, thumbEnd = nil, nil, nil, nil
+    steerCenter, steerHalf, knobHome = nil, 81, nil
+    local function byName(n)
+        if not n or n == "" then return nil end
+        local o
+        pcall(function() o = PlayerGui:FindFirstChild(n, true) end)
+        if not o then pcall(function() o = CoreGui:FindFirstChild(n, true) end) end
+        if o and o:IsA("GuiObject") and not o:IsDescendantOf(gui) then return o end
+        return nil
+    end
+    steerZone  = byName(STEER_ZONE_NAME)
+    steerKnob  = byName(KNOB_NAME)
+    steerTrack = byName(TRACK_NAME)
+    thumbEnd   = byName(THUMB_END_NAME)
+    if steerKnob then pcall(function() knobHome = steerKnob.Position end) end
+    -- 中心优先取 Track 中心 (=滑块回正位), 退回 SteerZone 中心
+    local ref = steerTrack or steerZone
+    if ref then
+        pcall(function()
+            local pp, sz = ref.AbsolutePosition, ref.AbsoluteSize
+            steerCenter = Vector2.new(pp.X + sz.X / 2, pp.Y + sz.Y / 2)
+        end)
+    end
+    -- 半程: (Track宽 - Knob宽)/2 ; 报告 216-54 -> 81
+    if STEER_HALF > 0 then
+        steerHalf = STEER_HALF
+    elseif steerTrack and steerKnob then
+        pcall(function()
+            steerHalf = math.max(12, (steerTrack.AbsoluteSize.X - steerKnob.AbsoluteSize.X) * 0.5)
+        end)
+    end
+    if not steerCenter then steerCenter = Vector2.new(135, 235) end
+    return steerZone
+end
+-- [TEST_STEER_END]
 
 local function findObjects()
     remoteObjs, remoteNames, stickVals, valueNames = {}, {}, {}, {}
@@ -666,16 +735,16 @@ local function applyFireSignal(v)
 end
 
 local function applyKnob(v)
-    if not TRY_KNOB or not stick or not knobBase then return end
+    if not TRY_KNOB or not steerKnob or not knobHome then chanKnob = "无滑块"; return end
     local ok = pcall(function()
-        stick.Position = UDim2.new(knobBase.X.Scale,
-            knobBase.X.Offset + v * stickRadius * STICK_SIGN,
-            knobBase.Y.Scale, knobBase.Y.Offset)
+        steerKnob.Position = UDim2.new(knobHome.X.Scale,
+            knobHome.X.Offset + v * steerHalf * STICK_SIGN,
+            knobHome.Y.Scale, knobHome.Y.Offset)
     end)
     chanKnob = ok and "OK" or "失败"
 end
 local function restoreKnob()
-    if stick and knobBase then pcall(function() stick.Position = knobBase end) end
+    if steerKnob and knobHome then pcall(function() steerKnob.Position = knobHome end) end
 end
 
 -- V8: 伪造 UserInputService.TouchMoved (Roblox 默认动态摇杆 ThumbstickStart 真正读的输入)
@@ -732,6 +801,52 @@ local function releaseUIS()
         uisDown = false
     end
 end
+
+-- V11 主通道: firesignal 伪造 SteerZone 的【完整手势】Begin -> Change -> End
+--   V8/V10 只发 InputChanged 且打在 ThumbstickStart(走路摇杆)上, 游戏因无活跃触摸而忽略。
+-- [TEST_ZONE_START]
+local function applySteerZone(v)
+    if not TRY_STEER or not steerZone or not steerCenter then chanSteer = "未锁定"; return end
+    local fs = getFireSignal()
+    if type(fs) ~= "function" then chanSteer = "无firesignal"; return end
+    local px = steerCenter.X + v * steerHalf * STICK_SIGN
+    local py = steerCenter.Y
+    local function fake(state)
+        return {
+            Position = Vector3.new(px, py, 0),
+            Delta    = Vector3.new(v * 4, 0, 0),
+            UserInputType  = Enum.UserInputType.Touch,
+            UserInputState = state,
+            KeyCode = Enum.KeyCode.Unknown,
+        }
+    end
+    local n = 0
+    pcall(function()
+        if not steerDown then
+            fs(steerZone.InputBegan, fake(Enum.UserInputState.Begin)); n = n + 1
+            steerDown = true
+        end
+        fs(steerZone.InputChanged, fake(Enum.UserInputState.Change)); n = n + 1
+    end)
+    chanSteer = "fire" .. n
+end
+local function releaseSteerZone()
+    if steerDown and steerZone then
+        local fs = getFireSignal()
+        if type(fs) == "function" and steerCenter then
+            pcall(function()
+                fs(steerZone.InputEnded, {
+                    Position = Vector3.new(steerCenter.X, steerCenter.Y, 0),
+                    UserInputType  = Enum.UserInputType.Touch,
+                    UserInputState = Enum.UserInputState.End,
+                    KeyCode = Enum.KeyCode.Unknown,
+                })
+            end)
+        end
+    end
+    steerDown = false
+end
+-- [TEST_ZONE_END]
 
 -- V8: 自动学习游戏自己的转向 RemoteEvent (无需用户截图 / 复制 / 看控制台)
 local installHook
@@ -837,6 +952,7 @@ local function bindVehicle(v)
     -- 一次性取证 (只在开启 / 换车时做)
     local cam = Workspace.CurrentCamera
     local vp = (cam and cam.ViewportSize) or Vector2.new(1280, 720)
+    findSteer()
     findStick(vp.X, vp.Y)
     findObjects()
     detectTouch()
@@ -858,6 +974,9 @@ updateDiag = function(force)
     local now = os.clock()
     if not force and now - diagT < 0.3 then return end
     diagT = now
+    -- V11 安全别名: startAuto() 的首次 updateDiag(true) 早于 findSteer(), 任何时序都不崩在 .X 上
+    local sc = steerCenter or Vector2.new(135, 235)
+    local sh = steerHalf or 81
     local seatType = veh and (veh.isVehicleSeat and "VehicleSeat" or "普通Seat") or "未坐车"
     -- 实时状态 (V10): 一行一个属性, 12 个短行, 每行按显示宽度截断, 绝不横向裁断
     local L = {}
@@ -865,51 +984,77 @@ updateDiag = function(force)
     put("座位 " .. seatType)
     put(string.format("目标 %+.2f", curSteer))
     put(probeInfo)
-    put("摇杆 " .. ((stick and stick.Name) or "未锁定"))
+    put("转向 " .. ((steerZone and steerZone.Name) or "未锁") .. "/" .. ((steerKnob and steerKnob.Name) or "-"))
     put("触摸 " .. chanTouch)
-    put("UIS " .. (uisOK and "可用" or "不可用") .. " fire " .. chanFire)
+    put("通道 " .. chanSteer .. " | fire " .. chanFire)
     put("学习 " .. learnedName .. " 候选 R" .. #remoteObjs .. " V" .. #stickVals)
     put("座位属性 " .. chanSeat)
     put("knob " .. chanKnob .. " Val " .. chanVal)
     put("车 " .. ((veh and veh.model and veh.model.Name) or "无"))
     put("车身 " .. ((veh and veh.body and veh.body.Name) or "无"))
-    put("摇杆中心 " .. ((stickCenter and string.format("%.0f,%.0f R%.0f",
-        stickCenter.X, stickCenter.Y, stickRadius)) or "-"))
+    put(string.format("中心 %.0f,%.0f 半程%.0f", sc.X, sc.Y, sh))
     local stateText = table.concat(L, "\n")
     if not showingReport then diag.Text = stateText end
+
+    -- V11 报告精简: 888 个候选里只留【转向相关】, 噪音(Scanline/Dot/Selection)全部剔除
+    local function steerRelated(line)
+        local l = line:lower()
+        for _, k in ipairs({"steer", "knob", "track", "wheel", "thumb", "stick",
+                           "joystick", "drag", "zone", "摇杆", "方向"}) do
+            if l:find(k, 1, true) then return true end
+        end
+        return false
+    end
+    local function suspects(list)
+        local out = {}
+        for _, nm in ipairs(list) do
+            if SUSPECT_REMOTES[nm] then out[#out + 1] = nm end
+        end
+        return out
+    end
+    local relCands = {}
+    for _, x in ipairs(stickCands) do
+        if steerRelated(x) and #relCands < 24 then relCands[#relCands + 1] = x end
+    end
+    local susp = suspects(remoteNames)
 
     -- 完整报告 (点「复制诊断 / 翻页」会分页显示, 也可复制整段文本)
     local R = {}
     local function add(x) R[#R + 1] = clipLine(x, DIAG_W) end
-    add("=== WK V10 诊断报告 ===")
+    add("=== WK V11 诊断报告 ===")
     for _, x in ipairs(L) do add(x) end           -- 复用实时 12 短行, 不重复拼长句
-    add("--- 摇杆候选 (" .. #stickCands .. ") ---")
-    for i, x in ipairs(stickCands) do if i <= 12 then add(x) end end
+    add("--- V11 锁定对象 ---")
+    add("热区 " .. ((steerZone and steerZone.Name) or "未锁") ..
+        " 滑块 " .. ((steerKnob and steerKnob.Name) or "-") ..
+        " 槽 " .. ((steerTrack and steerTrack.Name) or "-"))
+    add(string.format("中心 %.0f,%.0f 半程%.0f fire %s", sc.X, sc.Y, sh, chanSteer))
+    add("--- 转向候选 (" .. #relCands .. "/" .. #stickCands .. ") ---")
+    for _, x in ipairs(relCands) do add(x) end
+    add("--- 疑似转向 Remote (" .. #susp .. ") ---")
+    for _, x in ipairs(susp) do add(x) end
     add("--- RemoteEvent (" .. #remoteNames .. ") ---")
-    for i, x in ipairs(remoteNames) do if i <= 60 then add(x) end end
+    for i2, x in ipairs(remoteNames) do if i2 <= 40 then add(x) end end
     add("--- 转向 Value (" .. #valueNames .. ") ---")
-    for i, x in ipairs(valueNames) do if i <= 12 then add(x) end end
-    add("--- ScreenGui ---")
-    pcall(function()
-        for _, parent in ipairs({PlayerGui, CoreGui}) do
-            for _, o in ipairs(parent:GetChildren()) do
-                if o:IsA("ScreenGui") and o ~= gui then
-                    add(o.Name .. " [" .. tostring(o.Parent and o.Parent.Name) .. "]")
-                end
-            end
-        end
-    end)
+    for i2, x in ipairs(valueNames) do if i2 <= 12 then add(x) end end
     add("=== 学到 " .. learnedName .. " | 报告共 " .. #R .. " 行 ===")
     reportLines = R
     -- 复制到剪贴板的版本【不截断】: 完整对象名一次给全, 便于精确接管
     local F = {}
     local function addF(x) F[#F + 1] = x end
-    addF("=== WK V10 完整诊断 (未截断) ===")
+    addF("=== WK V11 完整诊断 (未截断·已滤噪音) ===")
     for _, x in ipairs(L) do addF(x) end
+    addF("--- V11 锁定对象 ---")
+    addF("热区 " .. ((steerZone and steerZone.Name) or "未锁") ..
+         " 滑块 " .. ((steerKnob and steerKnob.Name) or "-") ..
+         " 槽 " .. ((steerTrack and steerTrack.Name) or "-") ..
+         " 备选 " .. ((thumbEnd and thumbEnd.Name) or "-"))
+    addF(string.format("中心 %.0f,%.0f 半程%.0f fire %s", sc.X, sc.Y, sh, chanSteer))
+    addF("--- 转向候选 (" .. #relCands .. "/" .. #stickCands .. ") ---")
+    for _, x in ipairs(relCands) do addF(x) end
+    addF("--- 疑似转向 Remote (" .. #susp .. ") ---")
+    for _, x in ipairs(susp) do addF(x) end
     addF("--- RemoteEvent (" .. #remoteNames .. ") ---")
     for _, x in ipairs(remoteNames) do addF(x) end
-    addF("--- 摇杆候选 (" .. #stickCands .. ") ---")
-    for _, x in ipairs(stickCands) do addF(x) end
     addF("--- 转向 Value (" .. #valueNames .. ") ---")
     for _, x in ipairs(valueNames) do addF(x) end
     fullReport = table.concat(F, "\n")
@@ -972,6 +1117,7 @@ local function autoTick()
     replayLearned(curSteer)
     applyFireSignal(curSteer)
     applyKnob(curSteer)
+    applySteerZone(curSteer)
     doDrift(v.root, fw, curSteer)
     updateDiag()
     local turning = math.abs(target) > 0.2
@@ -1006,6 +1152,7 @@ local function stopAuto()
     if autoThread then pcall(function() task.cancel(autoThread) end); autoThread = nil end
     releaseTouch()
     releaseUIS()
+    releaseSteerZone()
     restoreKnob()
     lastSeat, rayParams, lastChar, lastModel = nil, nil, nil, nil
     wasTurning = false
@@ -1050,4 +1197,4 @@ refresh()
 refreshAuto()
 enableView()
 
-print("WK 已就绪 (视野 + 自动转弯 V10 · 诊断动态布局/短行不裁断 · ThumbstickStart通道 · 零联网) [WK_VIEW_V10]")
+print("WK 已就绪 (视野 + 自动转弯 V11 · 精确接管 SteerZone/Knob 转向条 · 零联网) [WK_VIEW_V11]")
